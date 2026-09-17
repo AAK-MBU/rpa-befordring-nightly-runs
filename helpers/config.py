@@ -8,3 +8,10 @@ MAX_RETRY = 10
 MAX_CONCURRENCY = 100  # tune based on backend capacity
 MAX_RETRIES = 3  # transient failure retries per item
 RETRY_BASE_DELAY = 0.5  # seconds (exponential backoff)
+
+# ----------------------
+# Dry-run mode
+# When True: log everything that would happen, but do not write to the
+# database or call any mutating endpoints.  Flip to False before deploying.
+# ----------------------
+DRY_RUN = False

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from datetime import date
 
 from automation_server_client import Workqueue
 
@@ -12,15 +13,19 @@ logger = logging.getLogger(__name__)
 
 
 def retrieve_items_for_queue() -> list[dict]:
-    """Function to populate queue"""
-    data = []
-    references = []
+    """Build the nightly workqueue.
 
-    items = [
-        {"reference": ref, "data": d} for ref, d in zip(references, data, strict=True)
+    Two items per run:
+    1. exec_sp          — runs usp_recalculate_bevilling_status for all bevillinger.
+    2. calculate_gaaafstand — updates Elev.skoleafstand where it is currently NULL.
+    """
+
+    today = date.today().isoformat()
+
+    return [
+        # {"reference": f"{today}_exec_sp", "data": {"date": today, "action": "exec_sp"}},
+        {"reference": f"{today}__fetch_and_upsert_addresses", "data": {"date": today, "action": "_fetch_and_upsert_addresses"}},
     ]
-
-    return items
 
 
 def create_sort_key(item: dict) -> str:
