@@ -207,8 +207,6 @@ if __name__ == "__main__":
     prod_workqueue = ats.workqueue()
     process = ats.process
 
-    prod_workqueue.clear_workqueue()
-
     if args.queue:
         asyncio.run(populate_queue(prod_workqueue, args.action))
 
