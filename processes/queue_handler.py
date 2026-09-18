@@ -8,23 +8,52 @@ from datetime import date
 from automation_server_client import Workqueue
 
 from helpers import config
+from processes.process_item import ACTIONS
 
 logger = logging.getLogger(__name__)
 
 
-def retrieve_items_for_queue() -> list[dict]:
-    """Build the nightly workqueue.
+def retrieve_items_for_queue(action: str = "nightly_run") -> list[dict]:
+    """Build the workqueue: one item, for the action being run.
 
-    Two items per run:
-    1. exec_sp          — runs usp_recalculate_bevilling_status for all bevillinger.
-    2. calculate_gaaafstand — updates Elev.skoleafstand where it is currently NULL.
+    Defaults to "nightly_run", the whole pipeline. The seven steps form a
+    dependency chain — addresses before people, people before their addresses,
+    status before deriving a school from a bevilling, everything before the
+    walking distance — and separate workqueue items would give no ordering
+    guarantee, so the chain is one item rather than seven.
+
+    Any individual step can be queued instead, for a re-run or a test:
+
+        python main.py --queue --process --action usp_upsert_elev_from_stg
+
+    Validated against process_item.ACTIONS rather than a list kept here, so a
+    step added to the dispatch is queueable without touching this file, and a
+    typo fails at queue time rather than when the item is picked up.
+
+    Args:
+        action:
+            Which action to queue. Must be a key of process_item.ACTIONS.
+
+    Returns:
+        A single item, referenced {today}_{action} — so queueing the same
+        action twice in one day is deduplicated by the caller.
+
+    Raises:
+        ValueError: If the action is not one this process knows.
     """
+
+    if action not in ACTIONS:
+        raise ValueError(
+            f"Unknown action: {action}. Known actions: {', '.join(ACTIONS)}"
+        )
 
     today = date.today().isoformat()
 
     return [
-        # {"reference": f"{today}_exec_sp", "data": {"date": today, "action": "exec_sp"}},
-        {"reference": f"{today}__fetch_and_upsert_addresses", "data": {"date": today, "action": "_fetch_and_upsert_addresses"}},
+        {
+            "reference": f"{today}_{action}",
+            "data": {"date": today, "action": action},
+        },
     ]
 
 
