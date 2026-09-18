@@ -12,8 +12,6 @@ dependencies = [
     "pillow",
     "requests_ntlm >= 1.2.0",
     "ruff",
-    "sqlalchemy>=2.0.25",
-    "sqlmodel>=0.0.14",
 ]
 
 [tool.uv.sources]
@@ -21,3 +19,29 @@ automation-server-client = { git = "https://github.com/odense-rpa/automation-ser
 
 [tool.setuptools]
 py-modules = []
+
+# Ruff discovers configuration by walking UP from the file being linted, and it
+# skips a pyproject.toml that has no [tool.ruff] section. Without this block it
+# kept climbing past the repo root and picked up whatever config sat above the
+# checkout — so `ruff check` locally enforced a different rule set than CI,
+# which checks out this repo alone and therefore found nothing to climb to.
+#
+# This section exists to stop that search here, so local and CI agree.
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+# Ruff's defaults (E4, E7, E9, F) plus import sorting.
+#
+# Deliberately NOT enabled:
+#
+#   BLE  blind-except. Every `except Exception` in this repo is a catch-all on
+#        purpose — the ATS retry loop, the per-student distance calls, the
+#        workqueue backoff. Each one exists so that a single failure is logged
+#        and the run continues rather than taking the night down with it.
+#
+#   DTZ  timezone-aware datetimes. date.today() in queue_handler builds the
+#        workqueue reference, {today}_{action}. It is a local calendar day by
+#        intent: the run is scheduled in local time and a caseworker reading the
+#        reference expects the date they would write down.
+select = ["E4", "E7", "E9", "F", "I"]

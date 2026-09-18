@@ -3,32 +3,35 @@
 import logging
 import os
 import uuid
-
 from functools import partial
 
 import pyodbc
 import requests
-
 from mbu_rpa_core.exceptions import BusinessError
-from sqlalchemy import text
 
 from helpers import config
-from helpers.db import get_db
 
 logger = logging.getLogger(__name__)
 
 
-# Connection strings, read once. Kept here rather than re-read inside every
-# function so there is one place to see which databases this process touches.
+# The two databases this process touches, read once.
 #
-#   SERVER29  LOIS — the source for both addresses and person/address links.
-#             Read only.
-#   PROD      Befordringssystemet — the target everything is written to.
-#   DEV       Befordringssystemet on the dev server. Not used by the nightly
-#             run; kept for pointing an ad-hoc run at dev instead.
+#   SERVER29     LOIS. The source for both the address register and the
+#                person -> address links. Read only, and a different server,
+#                which is the whole reason the CPR list has to be shipped to it
+#                rather than joined against.
+#
+#   BEFORDRING   Befordringssystemet. Everything this process writes goes here,
+#                and every stored procedure it calls lives here.
+#
+# One target, deliberately. This used to be two: a SQLAlchemy session factory
+# reading DBCONNECTIONSTRINGBEFORDRING alongside raw pyodbc steps reading
+# another variable. The run could then stage rows in one database and merge
+# them in another — which is exactly how it failed, with "Could not find stored
+# procedure 'befordring.usp_upsert_elev_from_stg'" on a procedure that had been
+# deployed, just not to the database that step connected to.
 CONN_STRING_SERVER29 = os.getenv("DBCONNECTIONSTRINGSERVER29")
-CONN_STRING_PROD = os.getenv("DBCONNECTIONSTRINGPROD")
-CONN_STRING_DEV = os.getenv("DBCONNECTIONSTRINGDEV")
+CONN_STRING_BEFORDRING = os.getenv("DBCONNECTIONSTRINGBEFORDRING")
 
 
 def process_item(item_data: dict, item_reference: str):
@@ -51,6 +54,34 @@ def process_item(item_data: dict, item_reference: str):
         )
 
     handler()
+
+
+def _connect(autocommit: bool = True):
+    """Open a connection to Befordringssystemet.
+
+    autocommit defaults to True because most statements here are EXEC calls,
+    and every procedure in this pipeline opens and commits its own transaction.
+    Wrapping those in an outer one only nests them, and a procedure that hits
+    its CATCH rolls back every level at once — leaving the caller holding a
+    transaction that no longer exists.
+
+    Pass autocommit=False where several statements must land together.
+    """
+
+    _require(DBCONNECTIONSTRINGBEFORDRING=CONN_STRING_BEFORDRING)
+
+    return pyodbc.connect(CONN_STRING_BEFORDRING, autocommit=autocommit)
+
+
+def _rows_as_dicts(cursor) -> list[dict]:
+    """Read a result set as dicts, using the cursor's own column names."""
+
+    if cursor.description is None:
+        return []
+
+    columns = [column[0] for column in cursor.description]
+
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
 def _require(**named: str | None) -> None:
@@ -83,11 +114,12 @@ def _run_sp(procedure: str, label: str) -> dict | None:
         logger.info("DRY RUN — %s: skipped (procedure has no dry-run mode)", label)
         return None
 
-    with get_db() as db:
-        rows = db.execute(text(f"EXEC [befordring].[{procedure}]")).mappings().all()
-        db.commit()
+    with _connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"EXEC [befordring].[{procedure}]")
+        rows = _rows_as_dicts(cursor)
 
-    counts = dict(rows[0]) if rows else {}
+    counts = rows[0] if rows else {}
 
     logger.info(
         "%s: %s",
@@ -201,18 +233,17 @@ def _exec_sp():
     if config.DRY_RUN:
         logger.info("DRY RUN — exec_sp: calling SP with @dry_run = 1 (no writes)")
 
-    sql = text("""
+    sql = """
         EXEC [befordring].[usp_recalculate_bevilling_status]
-            @bevilling_id = :bevilling_id,
-            @today        = :today,
-            @dry_run      = :dry_run
-    """)
+            @bevilling_id = ?,
+            @today        = ?,
+            @dry_run      = ?
+    """
 
-    with get_db() as db:
-        result = db.execute(sql, {"bevilling_id": None, "today": None, "dry_run": dry_run_flag})
-        rows = [dict(row) for row in result.mappings().all()]
-        if not config.DRY_RUN:
-            db.commit()
+    with _connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, None, None, dry_run_flag)
+        rows = _rows_as_dicts(cursor)
 
     changed = [r for r in rows if r.get("status_will_change")]
     logger.info(
@@ -239,13 +270,13 @@ def _fetch_and_upsert_addresses():
 
     _require(
         DBCONNECTIONSTRINGSERVER29=CONN_STRING_SERVER29,
-        DBCONNECTIONSTRINGPROD=CONN_STRING_PROD,
+        DBCONNECTIONSTRINGBEFORDRING=CONN_STRING_BEFORDRING,
     )
 
     load_id = str(uuid.uuid4())
 
     fetch_sql = """
-        SELECT top (10)
+        SELECT
             CONVERT(NVARCHAR(36), [AdresseId]) AS adresse_id,
             [AdresseBetegnelse] AS adresse_tekst,
             CAST([Lat] AS FLOAT) AS latitude,
@@ -286,7 +317,7 @@ def _fetch_and_upsert_addresses():
     print(f"Starting address import with load_id: {load_id}")
     print()
 
-    with pyodbc.connect(CONN_STRING_SERVER29) as source_conn, pyodbc.connect(CONN_STRING_PROD) as target_conn:
+    with pyodbc.connect(CONN_STRING_SERVER29) as source_conn, pyodbc.connect(CONN_STRING_BEFORDRING) as target_conn:
         source_cursor = source_conn.cursor()
         target_cursor = target_conn.cursor()
 
@@ -375,7 +406,7 @@ def _fetch_and_upsert_person_adresser():
 
     _require(
         DBCONNECTIONSTRINGSERVER29=CONN_STRING_SERVER29,
-        DBCONNECTIONSTRINGPROD=CONN_STRING_PROD,
+        DBCONNECTIONSTRINGBEFORDRING=CONN_STRING_BEFORDRING,
     )
 
     load_id = str(uuid.uuid4())
@@ -406,7 +437,7 @@ def _fetch_and_upsert_person_adresser():
     print(f"Starting person-address import with load_id: {load_id}")
     print()
 
-    with pyodbc.connect(CONN_STRING_SERVER29) as source_conn, pyodbc.connect(CONN_STRING_PROD) as target_conn:
+    with pyodbc.connect(CONN_STRING_SERVER29) as source_conn, pyodbc.connect(CONN_STRING_BEFORDRING) as target_conn:
         source_cursor = source_conn.cursor()
         target_cursor = target_conn.cursor()
 
@@ -515,7 +546,7 @@ def _calculate_gaaafstand():
     #    School coordinates come from Elev's own matrikel_id /
     #    ungdomsuddannelse_id — NOT from the bevilling.
     # -----------------------------------------------------------------------
-    select_sql = text("""
+    select_sql = """
         SELECT
             e.cpr,
             ad.latitude                              AS addr_lat,
@@ -530,23 +561,26 @@ def _calculate_gaaafstand():
         LEFT JOIN [befordring].[Ungdomsuddannelse]  uu
                   ON  uu.ungdomsuddannelse_id = e.ungdomsuddannelse_id
         WHERE e.kraever_genberegning = 1
-    """)
+    """
 
     # -----------------------------------------------------------------------
     # 3. Write calculated distance and clear the flag in one statement.
     # -----------------------------------------------------------------------
-    update_sql = text("""
+    update_sql = """
         UPDATE [befordring].[Elev]
-        SET    skoleafstand         = :distance,
+        SET    skoleafstand         = ?,
                kraever_genberegning = 0
-        WHERE  cpr = :cpr
-    """)
+        WHERE  cpr = ?
+    """
 
     if config.DRY_RUN:
         logger.info("DRY RUN — calculate_gaaafstand: will log candidates and distances but write nothing")
 
-    with get_db() as db:
-        candidates = [dict(r) for r in db.execute(select_sql).mappings().all()]
+    with _connect(autocommit=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute(select_sql)
+        candidates = _rows_as_dicts(cursor)
+
         logger.info("calculate_gaaafstand: %d students flagged for distance recalculation", len(candidates))
 
         if not candidates:
@@ -601,11 +635,11 @@ def _calculate_gaaafstand():
                     distance_km,
                 )
             else:
-                db.execute(update_sql, {"cpr": row["cpr"], "distance": distance_km})
+                cursor.execute(update_sql, distance_km, row["cpr"])
             updated += 1
 
         if not config.DRY_RUN:
-            db.commit()
+            conn.commit()
 
     action = "would write" if config.DRY_RUN else "wrote"
     logger.info(

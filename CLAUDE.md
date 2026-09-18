@@ -66,10 +66,11 @@ Step 5 runs **before** step 6 deliberately: it is what turns Kommende into Aktiv
 | `processes/application_handler.py` | `startup/close/reset` lifecycle for GUI automation; exposes a global `APP` variable. All bodies are empty — kept from the template, nothing to start or close. |
 | `processes/error_handling.py` | `ErrorContext` dataclass + `handle_error()` + email/screenshot dispatch |
 | `helpers/ats_functions.py` | Thin wrappers around the ATS REST API (paginated item listing, item unpacking, logger init) |
-| `helpers/db.py` | Lazy SQLAlchemy engine/session factory over `DBCONNECTIONSTRINGBEFORDRING`; `get_db()` context manager |
 | `helpers/config.py` | Global tunables: `MAX_RETRY`, `MAX_CONCURRENCY`, `MAX_RETRIES`, `RETRY_BASE_DELAY`, `DRY_RUN` |
 
-Two database access styles coexist: `_exec_sp` goes through SQLAlchemy (`helpers.db.get_db`), while `_fetch_and_upsert_addresses` opens raw `pyodbc` connections from its own env vars.
+One database access style: raw `pyodbc`, through `_connect()` in `process_item.py`. It defaults to `autocommit=True`, because every stored procedure in this pipeline opens and commits its own transaction — wrapping those in an outer one only nests them, and a procedure that hits its `CATCH` rolls back every level at once, leaving the caller holding a transaction that no longer exists. `_calculate_gaaafstand` is the exception and passes `autocommit=False`, since its per-student updates should land together.
+
+This replaced a SQLAlchemy session factory in `helpers/db.py`. Nothing here maps a model or uses a relationship — every statement is a literal `EXEC` or `SELECT` — so the ORM was machinery with no job, and its session reading one connection variable while the pyodbc steps read another is how the two ended up pointing at different databases.
 
 ### Elev is not written from here
 
@@ -90,10 +91,8 @@ The underlying rule, already stated in `_calculate_gaaafstand`: the data worker 
 | `ATS_URL` | `automation_server_client`, `ats_functions` | Base URL for the Automation Server API |
 | `ATS_TOKEN` | `automation_server_client`, `ats_functions` | Bearer token for ATS authentication |
 | `ATS_WORKQUEUE_OVERRIDE` | `automation_server_client` | Override the workqueue ID (dev/test use) |
-| `DBCONNECTIONSTRINGBEFORDRING` | `helpers/db.py` | pyodbc connection string for the SQLAlchemy engine |
-| `DBCONNECTIONSTRINGSERVER29` | `_fetch_and_upsert_addresses` | LOIS source server (read; currently validated but not actually connected to — see TODOs) |
-| `DBCONNECTIONSTRINGDEV` | `_fetch_and_upsert_addresses` | Used for *both* the source and target connections today |
-| `DBCONNECTIONSTRINGPROD` | `_fetch_and_upsert_addresses` | Validated but otherwise unused |
+| `DBCONNECTIONSTRINGBEFORDRING` | every step | Befordringssystemet — the single target. Everything this process writes goes here, and every stored procedure it calls lives here |
+| `DBCONNECTIONSTRINGSERVER29` | `_fetch_and_upsert_addresses`, `_fetch_and_upsert_person_adresser` | LOIS. Source for the address register and the person → address links. Read only |
 | `API_ENDPOINT` / `API_KEY` | `_calculate_gaaafstand` (commented out) | Walking-distance backend |
 
 `mbu-dev-shared-components` reads a separate `PROD` database connection (`RPAConnection`) for SMTP constants (`Error Email`, `Email Friend`, `smtp_server`, `smtp_port`).
@@ -102,7 +101,7 @@ The underlying rule, already stated in `_calculate_gaaafstand`: the data worker 
 
 - The SSL verification bypass block at the top of `main.py` is marked **REMOVE BEFORE DEPLOYMENT** — it disables certificate checks for every `requests` call in the process.
 - `clear_workqueue()` in `main.py` runs before flag dispatch, so it clears the queue even on a `--process`-only run.
-- `_fetch_and_upsert_addresses` opens both connections against `DBCONNECTIONSTRINGDEV`, so the LOIS fetch never hits Server 29; its `fetch_sql` is also still capped at `SELECT top (10)`.
+- `_fetch_and_upsert_addresses` still caps its `fetch_sql` at `SELECT top (10)`, so a real run would import ten addresses and step 4 would skip every person whose address was not among them.
 - `retrieve_items_for_queue()` only queues `_fetch_and_upsert_addresses`; the `exec_sp` item is commented out and `_calculate_gaaafstand` has no dispatch branch in `process_item()`, so it cannot be reached even if queued.
 - `finalize_process()` is an empty stub.
 - `uv run ruff check .` and `ruff format --check .` currently fail (E402/F401 in `main.py` and `process_item.py`, three files unformatted).

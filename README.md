@@ -68,10 +68,8 @@ Tunables ligger i `helpers/config.py` — bl.a. `MAX_RETRY`, `MAX_CONCURRENCY`, 
 | `ATS_URL` | Base-URL til Automation Server API |
 | `ATS_TOKEN` | Bearer-token til ATS |
 | `ATS_WORKQUEUE_OVERRIDE` | Overskriver workqueue-id (dev/test) |
-| `DBCONNECTIONSTRINGBEFORDRING` | Forbindelse brugt af SQLAlchemy-motoren i `helpers/db.py` |
-| `DBCONNECTIONSTRINGSERVER29` | LOIS-kildeserver til adresseimporten |
-| `DBCONNECTIONSTRINGDEV` | Målserver (bruges i dag til både kilde og mål) |
-| `DBCONNECTIONSTRINGPROD` | Produktionsforbindelse |
+| `DBCONNECTIONSTRINGBEFORDRING` | Befordringssystemet — det eneste mål. Alt, hvad processen skriver, havner her, og alle stored procedures, den kalder, ligger her |
+| `DBCONNECTIONSTRINGSERVER29` | LOIS. Kilde til både adresseregistret og person → adresse-koblingerne. Kun læsning |
 | `API_ENDPOINT` / `API_KEY` | Backend til gåafstand (kun brugt af den udkommenterede kode) |
 
 SMTP-konstanter (`Error Email`, `Email Friend`, `smtp_server`, `smtp_port`) hentes af `mbu-dev-shared-components` fra `RPAConnection` mod `PROD`.
