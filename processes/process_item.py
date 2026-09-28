@@ -669,16 +669,16 @@ ACTIONS = {
     "nightly_run": _nightly_run,
 
     "_fetch_and_upsert_addresses": _fetch_and_upsert_addresses,
-    "usp_upsert_elev_from_stg": partial(
-        _run_sp, "usp_upsert_elev_from_stg", "upsert_elev"
-    ),
-    "usp_upsert_foraelder_from_stg": partial(
-        _run_sp, "usp_upsert_foraelder_from_stg", "upsert_foraelder"
-    ),
+
+    "usp_upsert_elev_from_stg": partial(_run_sp, "usp_upsert_elev_from_stg", "upsert_elev"),
+
+    "usp_upsert_foraelder_from_stg": partial(_run_sp, "usp_upsert_foraelder_from_stg", "upsert_foraelder"),
+
     "_fetch_and_upsert_person_adresser": _fetch_and_upsert_person_adresser,
+
     "exec_sp": _exec_sp,
-    "usp_sync_elev_matrikel_from_bevilling": partial(
-        _run_sp, "usp_sync_elev_matrikel_from_bevilling", "sync_elev_matrikel"
-    ),
+
+    "usp_sync_elev_matrikel_from_bevilling": partial(_run_sp, "usp_sync_elev_matrikel_from_bevilling", "sync_elev_matrikel"),
+
     "_calculate_gaaafstand": _calculate_gaaafstand,
 }
