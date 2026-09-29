@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 import uuid
 from functools import partial
 
@@ -524,6 +525,21 @@ def _fetch_and_upsert_person_adresser():
 # round-trips do not dominate. Nothing depends on the exact value.
 _GAAAFSTAND_BATCH = 100
 
+# How often to say where the run is, in seconds. The step is one external
+# round-trip per student and runs for many minutes, so silence has to be kept
+# short enough that a stall is distinguishable from ordinary slowness.
+_GAAAFSTAND_HEARTBEAT = 30
+
+
+def _varighed(sekunder: float) -> str:
+    """Seconds as mm:ss, or h:mm:ss once it runs past an hour."""
+
+    sekunder = int(max(sekunder, 0))
+    timer, rest = divmod(sekunder, 3600)
+    minutter, sek = divmod(rest, 60)
+
+    return f"{timer}:{minutter:02d}:{sek:02d}" if timer else f"{minutter}:{sek:02d}"
+
 
 def _calculate_gaaafstand():
     """Recalculate walking distance (skoleafstand) for students flagged by the
@@ -701,15 +717,33 @@ def _calculate_gaaafstand():
     fejl: dict[str, list[str]] = {}
     ventende: list[tuple[float, str]] = []
 
+    startet = time.monotonic()
+    sidste_puls = startet
+
     def _skriv(batch: list[tuple[float, str]]) -> None:
         """One short transaction per batch — locks held for milliseconds."""
 
-        if not batch or config.DRY_RUN:
+        if not batch:
             return
+
+        if config.DRY_RUN:
+            logger.info("DRY RUN — would commit %d measurement(s)", len(batch))
+            return
+
+        t0 = time.monotonic()
 
         with _connect(autocommit=False) as skrive_conn:
             skrive_conn.cursor().executemany(update_sql, batch)
             skrive_conn.commit()
+
+        logger.info(
+            "calculate_gaaafstand: committed %d measurement(s) in %.2fs — "
+            "%d of %d written so far",
+            len(batch),
+            time.monotonic() - t0,
+            updated,
+            len(candidates),
+        )
 
     for i, row in enumerate(candidates, start=1):
         school_lat = row["school_lat"]
@@ -799,14 +833,28 @@ def _calculate_gaaafstand():
 
         # Each measurement is an external round-trip to OpenRouteService via
         # the backend, so this step is minutes long by nature. Silence for
-        # that long reads as a hang — say where it is.
-        if i % 100 == 0:
+        # that long reads as a hang — say where it is, on the clock rather
+        # than every N students, so the interval stays the same however fast
+        # or slow the distance API happens to be.
+        naa = time.monotonic()
+
+        if naa - sidste_puls >= _GAAAFSTAND_HEARTBEAT or i == len(candidates):
+            sidste_puls = naa
+            forloebet = naa - startet
+            tempo = i / forloebet if forloebet else 0
+            tilbage = (len(candidates) - i) / tempo if tempo else 0
+
             logger.info(
-                "calculate_gaaafstand: %d/%d done (%d measured, %d skipped)",
+                "calculate_gaaafstand: %d/%d (%.0f%%) — %d measured, %d "
+                "skipped, %.1f/s, %s elapsed, ~%s left",
                 i,
                 len(candidates),
+                100 * i / len(candidates),
                 updated,
                 skipped,
+                tempo,
+                _varighed(forloebet),
+                _varighed(tilbage),
             )
 
     _skriv(ventende)
@@ -824,12 +872,15 @@ def _calculate_gaaafstand():
 
     action = "would write" if config.DRY_RUN else "wrote"
     logger.info(
-        "calculate_gaaafstand: %s %d distances, %d skipped across %d distinct "
-        "reason(s)",
+        "calculate_gaaafstand: done in %s — %s %d distances, %d skipped "
+        "across %d distinct reason(s). %d student(s) still flagged for a "
+        "later run.",
+        _varighed(time.monotonic() - startet),
         action,
         updated,
         skipped,
         len(fejl),
+        afventer + skipped,
     )
 
 
