@@ -530,6 +530,11 @@ _GAAAFSTAND_BATCH = 100
 # short enough that a stall is distinguishable from ordinary slowness.
 _GAAAFSTAND_HEARTBEAT = 30
 
+# Give up after this many failures in a row. One failure is a bad row; this
+# many is the service being down, and there is nothing to gain from spending
+# hours proving it one student at a time.
+_GAAAFSTAND_MAX_I_TRAEK = 25
+
 
 def _varighed(sekunder: float) -> str:
     """Seconds as mm:ss, or h:mm:ss once it runs past an hour."""
@@ -716,6 +721,26 @@ def _calculate_gaaafstand():
     # that says how many and why.
     fejl: dict[str, list[str]] = {}
     ventende: list[tuple[float, str]] = []
+    i_traek = 0
+
+    def _noter_fejl(grund: str, cpr: str) -> None:
+        """Record a failure, and say so out loud the first time it happens.
+
+        Aggregating keeps a bad night from printing thousands of identical
+        warnings, but waiting until the end to say ANYTHING means a run where
+        the distance API is unreachable looks like a run that is working.
+        The first of each kind is announced; the rest are counted.
+        """
+
+        if grund not in fejl:
+            logger.warning(
+                "calculate_gaaafstand: %s (first seen on CPR %s; further "
+                "occurrences are counted, not logged)",
+                grund,
+                cpr,
+            )
+
+        fejl.setdefault(grund, []).append(cpr)
 
     startet = time.monotonic()
     sidste_puls = startet
@@ -746,6 +771,36 @@ def _calculate_gaaafstand():
         )
 
     for i, row in enumerate(candidates, start=1):
+        # Say where the run is BEFORE anything that can `continue`. This sat
+        # at the bottom of the loop, after two `continue`s — so a run where
+        # every call failed printed the opening count and then nothing at
+        # all, for hours, which reads exactly like a hang. The one state
+        # where progress reporting matters most was the one state that
+        # silenced it.
+        #
+        # On the clock rather than every N students, so the interval stays
+        # the same however fast or slow the distance API happens to be.
+        naa = time.monotonic()
+
+        if naa - sidste_puls >= _GAAAFSTAND_HEARTBEAT:
+            sidste_puls = naa
+            forloebet = naa - startet
+            tempo = (i - 1) / forloebet if forloebet else 0
+            tilbage = (len(candidates) - i + 1) / tempo if tempo else 0
+
+            logger.info(
+                "calculate_gaaafstand: %d/%d (%.0f%%) — %d measured, %d "
+                "skipped, %.1f/s, %s elapsed, ~%s left",
+                i - 1,
+                len(candidates),
+                100 * (i - 1) / len(candidates),
+                updated,
+                skipped,
+                tempo,
+                _varighed(forloebet),
+                _varighed(tilbage),
+            )
+
         school_lat = row["school_lat"]
         school_lon = row["school_lon"]
 
@@ -753,11 +808,11 @@ def _calculate_gaaafstand():
         # excludes rows without coordinates, so reaching this means the
         # two have drifted apart.
         if school_lat is None or school_lon is None:
-            fejl.setdefault(
+            _noter_fejl(
                 "no school coordinates even though select_sql required "
                 "them — the query and this check have drifted apart",
-                [],
-            ).append(row["cpr"])
+                row["cpr"],
+            )
             skipped += 1
             continue
 
@@ -802,9 +857,31 @@ def _calculate_gaaafstand():
                     svar.get("duration_minutes", "?"),
                 )
         except Exception as exc:
-            fejl.setdefault(f"distance API failed: {exc}", []).append(row["cpr"])
+            _noter_fejl(f"distance API failed: {exc}", row["cpr"])
             skipped += 1
+            i_traek += 1
+
+            # Nothing is getting through. At a 15-second timeout each, 1800
+            # students is most of a day of failing one at a time — so stop
+            # and say why instead of grinding through the whole list. The
+            # flags stay raised, so the next run simply picks them all up.
+            if i_traek >= _GAAAFSTAND_MAX_I_TRAEK:
+                logger.error(
+                    "calculate_gaaafstand: %d consecutive failures — giving "
+                    "up after %d of %d student(s). The distance API looks "
+                    "unavailable; check API_ENDPOINT, API_KEY and whether "
+                    "the backend can reach OpenRouteService. Every unmeasured "
+                    "student keeps kraever_genberegning = 1, so nothing is "
+                    "lost — the next run starts over.",
+                    i_traek,
+                    i,
+                    len(candidates),
+                )
+                break
+
             continue
+
+        i_traek = 0
 
         if config.DRY_RUN and updated < 10:
             # Only the first few: a dry run over the whole student population
@@ -831,31 +908,6 @@ def _calculate_gaaafstand():
             _skriv(ventende)
             ventende.clear()
 
-        # Each measurement is an external round-trip to OpenRouteService via
-        # the backend, so this step is minutes long by nature. Silence for
-        # that long reads as a hang — say where it is, on the clock rather
-        # than every N students, so the interval stays the same however fast
-        # or slow the distance API happens to be.
-        naa = time.monotonic()
-
-        if naa - sidste_puls >= _GAAAFSTAND_HEARTBEAT or i == len(candidates):
-            sidste_puls = naa
-            forloebet = naa - startet
-            tempo = i / forloebet if forloebet else 0
-            tilbage = (len(candidates) - i) / tempo if tempo else 0
-
-            logger.info(
-                "calculate_gaaafstand: %d/%d (%.0f%%) — %d measured, %d "
-                "skipped, %.1f/s, %s elapsed, ~%s left",
-                i,
-                len(candidates),
-                100 * i / len(candidates),
-                updated,
-                skipped,
-                tempo,
-                _varighed(forloebet),
-                _varighed(tilbage),
-            )
 
     _skriv(ventende)
 
