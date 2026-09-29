@@ -519,6 +519,12 @@ def _fetch_and_upsert_person_adresser():
     }
 
 
+# How many measurements to commit at a time. Small enough that Elev is never
+# locked long enough for the application to notice, large enough that the
+# round-trips do not dominate. Nothing depends on the exact value.
+_GAAAFSTAND_BATCH = 100
+
+
 def _calculate_gaaafstand():
     """Recalculate walking distance (skoleafstand) for students flagged by the
     data worker's nightly job.
@@ -616,7 +622,24 @@ def _calculate_gaaafstand():
     if config.DRY_RUN:
         logger.info("DRY RUN — calculate_gaaafstand: will log candidates and distances but write nothing")
 
-    with _connect(autocommit=False) as conn:
+    # -----------------------------------------------------------------------
+    # The connection is opened, read from and CLOSED before any HTTP happens.
+    #
+    # This step used to hold one transaction open across the whole loop:
+    # autocommit=False, an UPDATE per student inside the loop, one commit at
+    # the end. Every UPDATE takes an exclusive row lock on Elev and holds it
+    # until that commit, and past a few thousand locks SQL Server escalates to
+    # a lock on the whole table — while the loop is still waiting on
+    # OpenRouteService, one student at a time. The application's own queries
+    # then queue behind it and the site serves 504s until the run finishes.
+    #
+    # Nothing here needs a long transaction. The reads are a snapshot, the
+    # writes are independent of each other, and the flag is only cleared on a
+    # successful measurement — so committing in batches is not just safe, it
+    # makes a run that dies half way keep what it had instead of losing all
+    # of it.
+    # -----------------------------------------------------------------------
+    with _connect() as conn:
         cursor = conn.cursor()
         cursor.execute(select_sql)
         candidates = _rows_as_dicts(cursor)
@@ -624,83 +647,101 @@ def _calculate_gaaafstand():
         cursor.execute(afventer_sql)
         afventer = cursor.fetchone()[0]
 
-        logger.info(
-            "calculate_gaaafstand: %d student(s) can be measured. A further "
-            "%d are flagged but have no school yet — they keep the flag and "
-            "appear here once a bevilling gives them one.",
-            len(candidates),
-            afventer,
-        )
+    logger.info(
+        "calculate_gaaafstand: %d student(s) can be measured. A further "
+        "%d are flagged but have no school yet — they keep the flag and "
+        "appear here once a bevilling gives them one.",
+        len(candidates),
+        afventer,
+    )
 
-        if not candidates:
+    if not candidates:
+        return
+
+    updated = 0
+    skipped = 0
+    # Failures grouped by what went wrong, not logged one student at a time.
+    # When the distance API is down or rate-limiting, every candidate fails
+    # the same way, and thousands of identical warnings bury the one line
+    # that says how many and why.
+    fejl: dict[str, list[str]] = {}
+    ventende: list[tuple[float, str]] = []
+
+    def _skriv(batch: list[tuple[float, str]]) -> None:
+        """One short transaction per batch — locks held for milliseconds."""
+
+        if not batch or config.DRY_RUN:
             return
 
-        # -------------------------------------------------------------------
-        # 2. Call the walking-distance API for each candidate
-        # -------------------------------------------------------------------
-        updated = 0
-        skipped = 0
-        # Failures grouped by what went wrong, not logged one student at a
-        # time. When the distance API is down or rate-limiting, every
-        # candidate fails the same way, and thousands of identical warnings
-        # bury the one line that says how many and why.
-        fejl: dict[str, list[str]] = {}
+        with _connect(autocommit=False) as skrive_conn:
+            skrive_conn.cursor().executemany(update_sql, batch)
+            skrive_conn.commit()
 
-        for row in candidates:
-            school_lat = row["school_lat"]
-            school_lon = row["school_lon"]
+    for i, row in enumerate(candidates, start=1):
+        school_lat = row["school_lat"]
+        school_lon = row["school_lon"]
 
-            # A safety net rather than the normal path: the query above now
-            # excludes rows without coordinates, so reaching this means the
-            # two have drifted apart.
-            if school_lat is None or school_lon is None:
-                fejl.setdefault(
-                    "no school coordinates even though select_sql required "
-                    "them — the query and this check have drifted apart",
-                    [],
-                ).append(row["cpr"])
-                skipped += 1
-                continue
+        # A safety net rather than the normal path: the query above now
+        # excludes rows without coordinates, so reaching this means the
+        # two have drifted apart.
+        if school_lat is None or school_lon is None:
+            fejl.setdefault(
+                "no school coordinates even though select_sql required "
+                "them — the query and this check have drifted apart",
+                [],
+            ).append(row["cpr"])
+            skipped += 1
+            continue
 
-            try:
-                resp = requests.get(
-                    f"{api_base}/bevilling/calculate_walking_distance",
-                    params={
-                        "lat1": row["addr_lat"],
-                        "lon1": row["addr_lon"],
-                        "lat2": school_lat,
-                        "lon2": school_lon,
-                    },
-                    headers=headers,
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                distance_km = resp.json()["distance_km"]
-            except Exception as exc:
-                fejl.setdefault(f"distance API failed: {exc}", []).append(row["cpr"])
-                skipped += 1
-                continue
+        try:
+            resp = requests.get(
+                f"{api_base}/bevilling/calculate_walking_distance",
+                params={
+                    "lat1": row["addr_lat"],
+                    "lon1": row["addr_lon"],
+                    "lat2": school_lat,
+                    "lon2": school_lon,
+                },
+                headers=headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            distance_km = resp.json()["distance_km"]
+        except Exception as exc:
+            fejl.setdefault(f"distance API failed: {exc}", []).append(row["cpr"])
+            skipped += 1
+            continue
 
-            if config.DRY_RUN:
-                # Only the first few: a dry run over the whole student
-                # population would otherwise print one line per student.
-                if updated < 10:
-                    logger.info(
-                        "DRY RUN — CPR %s: would set skoleafstand = %.3f km, "
-                        "kraever_genberegning → 0",
-                        row["cpr"],
-                        distance_km,
-                    )
-                elif updated == 10:
-                    logger.info(
-                        "DRY RUN — ... and the rest; see the count below."
-                    )
-            else:
-                cursor.execute(update_sql, distance_km, row["cpr"])
-            updated += 1
+        if config.DRY_RUN and updated < 10:
+            # Only the first few: a dry run over the whole student population
+            # would otherwise print one line per student.
+            logger.info(
+                "DRY RUN — CPR %s: would set skoleafstand = %.3f km, "
+                "kraever_genberegning → 0",
+                row["cpr"],
+                distance_km,
+            )
 
-        if not config.DRY_RUN:
-            conn.commit()
+        ventende.append((distance_km, row["cpr"]))
+        updated += 1
+
+        if len(ventende) >= _GAAAFSTAND_BATCH:
+            _skriv(ventende)
+            ventende.clear()
+
+        # Each measurement is an external round-trip to OpenRouteService via
+        # the backend, so this step is minutes long by nature. Silence for
+        # that long reads as a hang — say where it is.
+        if i % 100 == 0:
+            logger.info(
+                "calculate_gaaafstand: %d/%d done (%d measured, %d skipped)",
+                i,
+                len(candidates),
+                updated,
+                skipped,
+            )
+
+    _skriv(ventende)
 
     # One line per DISTINCT failure, with a few CPRs to chase it with. The
     # whole list is useless at this size and the reason is what matters.
