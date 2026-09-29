@@ -572,9 +572,34 @@ def _calculate_gaaafstand():
               )
     """
 
-    select_sql = """
-        SELECT
+    # TOP and the extra columns cost nothing on a full run: without a limit
+    # the TOP clause is omitted entirely, and the names are three columns on a
+    # query that already joins those tables.
+    top = f"TOP ({int(config.GAAAFSTAND_LIMIT)}) " if config.GAAAFSTAND_LIMIT else ""
+
+    # Test runs measure CLEAN students only: an Aktiv bevilling with no
+    # genbehandling raised. Without this a capped run would take whatever
+    # sorted first, which is as likely to be a student with a school or
+    # address mismatch as not — and a trial that trips over a known-bad row
+    # proves nothing about the normal path.
+    rene_elever = """
+          AND EXISTS (
+                  SELECT 1
+                  FROM   [befordring].[Bevilling] b
+                  JOIN   [befordring].[Status]    st ON st.status_id = b.status_id
+                  WHERE  b.cpr_elev = e.cpr
+                  AND    b.aktiv = 1
+                  AND    st.status_tekst = N'Aktiv'
+                  AND    ISNULL(b.genbehandling, 0) = 0
+              )
+    """ if config.GAAAFSTAND_LIMIT else ""
+
+    select_sql = f"""
+        SELECT {top}
             e.cpr,
+            e.skolekode,
+            ad.adresse_tekst                         AS addr_tekst,
+            COALESCE(sm.matrikel_navn, uu.ungdomsuddannelse_navn) AS school_navn,
             ad.latitude                              AS addr_lat,
             ad.longitude                             AS addr_lon,
             COALESCE(sm.latitude,  uu.latitude)      AS school_lat,
@@ -607,6 +632,7 @@ def _calculate_gaaafstand():
           AND COALESCE(sm.longitude, uu.longitude) IS NOT NULL
           AND ad.latitude  IS NOT NULL
           AND ad.longitude IS NOT NULL
+          {rene_elever}
     """
 
     # -----------------------------------------------------------------------
@@ -646,6 +672,14 @@ def _calculate_gaaafstand():
 
         cursor.execute(afventer_sql)
         afventer = cursor.fetchone()[0]
+
+    if config.GAAAFSTAND_LIMIT:
+        logger.info(
+            "calculate_gaaafstand: TEST RUN — capped at %d student(s), and "
+            "only ones with an Aktiv bevilling and no genbehandling. The "
+            "rest keep kraever_genberegning = 1 for the next run.",
+            config.GAAAFSTAND_LIMIT,
+        )
 
     logger.info(
         "calculate_gaaafstand: %d student(s) can be measured. A further "
@@ -693,6 +727,23 @@ def _calculate_gaaafstand():
             skipped += 1
             continue
 
+        if config.GAAAFSTAND_VERBOSE:
+            logger.info(
+                "  [%d/%d] CPR %s (skolekode %s)\n"
+                "        hjem:  %s  (%s, %s)\n"
+                "        skole: %s  (%s, %s)",
+                i,
+                len(candidates),
+                row["cpr"],
+                row.get("skolekode"),
+                row.get("addr_tekst") or "(ingen adressetekst)",
+                row["addr_lat"],
+                row["addr_lon"],
+                row.get("school_navn") or "(intet navn)",
+                school_lat,
+                school_lon,
+            )
+
         try:
             resp = requests.get(
                 f"{api_base}/bevilling/calculate_walking_distance",
@@ -706,7 +757,16 @@ def _calculate_gaaafstand():
                 timeout=15,
             )
             resp.raise_for_status()
-            distance_km = resp.json()["distance_km"]
+            svar = resp.json()
+            distance_km = svar["distance_km"]
+
+            if config.GAAAFSTAND_VERBOSE:
+                logger.info(
+                    "        svar:  HTTP %s — %.3f km, %s min",
+                    resp.status_code,
+                    distance_km,
+                    svar.get("duration_minutes", "?"),
+                )
         except Exception as exc:
             fejl.setdefault(f"distance API failed: {exc}", []).append(row["cpr"])
             skipped += 1
@@ -725,7 +785,15 @@ def _calculate_gaaafstand():
         ventende.append((distance_km, row["cpr"]))
         updated += 1
 
-        if len(ventende) >= _GAAAFSTAND_BATCH:
+        if config.GAAAFSTAND_VERBOSE:
+            logger.info(
+                "        skriv: skoleafstand = %.3f, kraever_genberegning "
+                "-> 0 %s",
+                distance_km,
+                "(DRY RUN — skrives ikke)" if config.DRY_RUN else "(i naeste batch)",
+            )
+
+        if len(ventende) >= (1 if config.GAAAFSTAND_LIMIT else _GAAAFSTAND_BATCH):
             _skriv(ventende)
             ventende.clear()
 
