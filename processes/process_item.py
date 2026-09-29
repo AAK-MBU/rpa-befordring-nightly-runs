@@ -535,6 +535,18 @@ _GAAAFSTAND_HEARTBEAT = 30
 # hours proving it one student at a time.
 _GAAAFSTAND_MAX_I_TRAEK = 25
 
+# A rate-limited request is retried rather than counted as a loss, because the
+# student is fine — we simply asked too fast. Waiting a full window is the
+# only wait that helps: OpenRouteService counts over a rolling minute, so a
+# shorter pause just spends another request on the same rejection.
+_GAAAFSTAND_429_FORSOEG = 3
+_GAAAFSTAND_429_PAUSE = 65
+
+# How far the throttle is allowed to slow itself down when it keeps being
+# rate-limited. 6 seconds is 10 requests a minute — far below any plan, so
+# hitting this ceiling means the quota is exhausted, not the pace wrong.
+_GAAAFSTAND_MAX_INTERVAL = 6.0
+
 
 def _varighed(sekunder: float) -> str:
     """Seconds as mm:ss, or h:mm:ss once it runs past an hour."""
@@ -858,52 +870,91 @@ def _calculate_gaaafstand():
         # request, so a slow response counts towards the interval instead of
         # being added to it — otherwise a 2-second call plus a 1-second wait
         # would run at 20/minute, not 60.
-        if interval:
-            vent = naeste_tidligst - time.monotonic()
+        #
+        # A 429 is retried, not counted as a loss: nothing is wrong with the
+        # student, we just asked too fast. And the pace is PERMANENTLY slowed
+        # each time it happens, because the alternative is what the first run
+        # did — keep asking at a rate the plan will not serve, so the rolling
+        # window never drains and every remaining request is rejected. Forty
+        # students went through, then nothing, for the rest of the run.
+        distance_km = None
+        grund = None
 
-            if vent > 0:
-                time.sleep(vent)
+        for forsoeg in range(1, _GAAAFSTAND_429_FORSOEG + 1):
+            if interval:
+                vent = naeste_tidligst - time.monotonic()
 
-        naeste_tidligst = time.monotonic() + interval
+                if vent > 0:
+                    time.sleep(vent)
 
-        try:
-            resp = requests.get(
-                f"{api_base}/bevilling/calculate_walking_distance",
-                params={
-                    "lat1": row["addr_lat"],
-                    "lon1": row["addr_lon"],
-                    "lat2": school_lat,
-                    "lon2": school_lon,
-                },
-                headers=headers,
-                timeout=15,
+            naeste_tidligst = time.monotonic() + interval
+
+            try:
+                resp = requests.get(
+                    f"{api_base}/bevilling/calculate_walking_distance",
+                    params={
+                        "lat1": row["addr_lat"],
+                        "lon1": row["addr_lon"],
+                        "lat2": school_lat,
+                        "lon2": school_lon,
+                    },
+                    headers=headers,
+                    timeout=15,
+                )
+
+                # The backend turns EVERY OpenRouteService failure into a 502
+                # with the real reason in the body:
+                #
+                #     raise HTTPException(502, detail=f"Distance API error: {e}")
+                #
+                # raise_for_status() reports only "502 Server Error: Bad
+                # Gateway", the same sentence whether ORS rate-limited us,
+                # rejected the key or could not route between two points. The
+                # body is the only place the answer exists.
+                if resp.ok:
+                    svar = resp.json()
+                    distance_km = svar["distance_km"]
+
+                    if config.GAAAFSTAND_VERBOSE:
+                        logger.info(
+                            "        svar:  HTTP %s — %.3f km, %s min",
+                            resp.status_code,
+                            distance_km,
+                            svar.get("duration_minutes", "?"),
+                        )
+
+                    break
+
+                besked = f"HTTP {resp.status_code} — {resp.text[:300].strip()}"
+                rate_limited = resp.status_code == 429 or "429" in resp.text
+            except Exception as exc:
+                besked = str(exc)
+                rate_limited = False
+
+            grund = f"distance API failed: {besked}"
+
+            if not rate_limited or forsoeg == _GAAAFSTAND_429_FORSOEG:
+                break
+
+            if interval:
+                interval = min(interval * 1.5, _GAAAFSTAND_MAX_INTERVAL)
+
+            logger.warning(
+                "calculate_gaaafstand: rate limited by OpenRouteService on "
+                "attempt %d for CPR %s. Waiting %ds for the window to drain "
+                "and slowing to %.0f request(s)/minute for the rest of the "
+                "run.",
+                forsoeg,
+                row["cpr"],
+                _GAAAFSTAND_429_PAUSE,
+                60 / interval if interval else 0,
             )
-            # The backend turns EVERY OpenRouteService failure into a 502
-            # with the real reason in the body:
-            #
-            #     raise HTTPException(502, detail=f"Distance API error: {e}")
-            #
-            # raise_for_status() reports only "502 Server Error: Bad Gateway",
-            # which is the same sentence whether ORS rate-limited us, rejected
-            # the key or could not route between two points. The body is the
-            # only place the answer exists, so it goes in the message.
-            if not resp.ok:
-                raise RuntimeError(
-                    f"HTTP {resp.status_code} — {resp.text[:300].strip()}"
-                )
 
-            svar = resp.json()
-            distance_km = svar["distance_km"]
+            time.sleep(_GAAAFSTAND_429_PAUSE)
+            naeste_tidligst = time.monotonic()
 
-            if config.GAAAFSTAND_VERBOSE:
-                logger.info(
-                    "        svar:  HTTP %s — %.3f km, %s min",
-                    resp.status_code,
-                    distance_km,
-                    svar.get("duration_minutes", "?"),
-                )
-        except Exception as exc:
-            _noter_fejl(f"distance API failed: {exc}", row["cpr"])
+        if distance_km is None:
+            _noter_fejl(grund or "distance API failed: unknown", row["cpr"])
             skipped += 1
             i_traek += 1
 
@@ -914,30 +965,19 @@ def _calculate_gaaafstand():
             if i_traek >= _GAAAFSTAND_MAX_I_TRAEK:
                 logger.error(
                     "calculate_gaaafstand: %d consecutive failures — giving "
-                    "up after %d of %d student(s). The distance API looks "
-                    "unavailable; check API_ENDPOINT, API_KEY and whether "
-                    "the backend can reach OpenRouteService. Every unmeasured "
-                    "student keeps kraever_genberegning = 1, so nothing is "
-                    "lost — the next run starts over.",
+                    "up after %d of %d student(s). Every unmeasured student "
+                    "keeps kraever_genberegning = 1, so nothing is lost and "
+                    "the next run picks them up. Last reason: %s",
                     i_traek,
                     i,
                     len(candidates),
+                    grund,
                 )
                 break
 
             continue
 
         i_traek = 0
-
-        if config.DRY_RUN and updated < 10:
-            # Only the first few: a dry run over the whole student population
-            # would otherwise print one line per student.
-            logger.info(
-                "DRY RUN — CPR %s: would set skoleafstand = %.3f km, "
-                "kraever_genberegning → 0",
-                row["cpr"],
-                distance_km,
-            )
 
         ventende.append((distance_km, row["cpr"]))
         updated += 1
