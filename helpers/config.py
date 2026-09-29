@@ -36,10 +36,5 @@ DRY_RUN = False
 # what the distance API answered, and what was written.  Unusable at full
 # volume, which is why it is off by default and why LIMIT exists.
 # ----------------------
-GAAAFSTAND_LIMIT = int(os.getenv("GAAAFSTAND_LIMIT", "0")) or None
-GAAAFSTAND_VERBOSE = os.getenv("GAAAFSTAND_VERBOSE", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "ja",
-)
+GAAAFSTAND_LIMIT = 5
+GAAAFSTAND_VERBOSE = 1
