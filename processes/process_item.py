@@ -546,6 +546,26 @@ def _calculate_gaaafstand():
     #    School coordinates come from Elev's own matrikel_id /
     #    ungdomsuddannelse_id — NOT from the bevilling.
     # -----------------------------------------------------------------------
+    # How many are flagged but not measurable. Counted rather than listed:
+    # with the full student population this is a large number and it is not a
+    # problem — it is the normal resting state for a student without a
+    # bevilling. Logged so a sudden change in it is visible.
+    afventer_sql = """
+        SELECT COUNT(*)
+        FROM      [befordring].[Elev]              e
+        LEFT JOIN [befordring].[Adresse]            ad
+                  ON  ad.adresse_id = e.adresse_id
+        LEFT JOIN [befordring].[Skolematrikel]      sm
+                  ON  sm.matrikel_id = e.matrikel_id
+        LEFT JOIN [befordring].[Ungdomsuddannelse]  uu
+                  ON  uu.ungdomsuddannelse_id = e.ungdomsuddannelse_id
+        WHERE e.kraever_genberegning = 1
+          AND (
+                  COALESCE(sm.latitude, uu.latitude) IS NULL
+               OR ad.latitude IS NULL
+              )
+    """
+
     select_sql = """
         SELECT
             e.cpr,
@@ -561,6 +581,26 @@ def _calculate_gaaafstand():
         LEFT JOIN [befordring].[Ungdomsuddannelse]  uu
                   ON  uu.ungdomsuddannelse_id = e.ungdomsuddannelse_id
         WHERE e.kraever_genberegning = 1
+          /* Only students who can actually be measured.
+
+             Elev now holds every student in the municipality, not just the
+             ones with a bevilling, and usp_upsert_elev_from_stg raises
+             kraever_genberegning on every NEW student. Without these two
+             conditions the candidate set is most of the table, and each of
+             those rows is fetched, warned about and skipped — every night,
+             for ever, because the flag is only cleared on a successful
+             measurement.
+
+             The flag is deliberately LEFT RAISED on the students excluded
+             here. "Distance never computed" is true of them, and the moment
+             a bevilling gives them a school,
+             usp_sync_elev_matrikel_from_bevilling raises the flag again on
+             the change and they appear here of their own accord. Clearing it
+             would say the opposite and buy nothing. */
+          AND COALESCE(sm.latitude,  uu.latitude)  IS NOT NULL
+          AND COALESCE(sm.longitude, uu.longitude) IS NOT NULL
+          AND ad.latitude  IS NOT NULL
+          AND ad.longitude IS NOT NULL
     """
 
     # -----------------------------------------------------------------------
@@ -581,7 +621,16 @@ def _calculate_gaaafstand():
         cursor.execute(select_sql)
         candidates = _rows_as_dicts(cursor)
 
-        logger.info("calculate_gaaafstand: %d students flagged for distance recalculation", len(candidates))
+        cursor.execute(afventer_sql)
+        afventer = cursor.fetchone()[0]
+
+        logger.info(
+            "calculate_gaaafstand: %d student(s) can be measured. A further "
+            "%d are flagged but have no school yet — they keep the flag and "
+            "appear here once a bevilling gives them one.",
+            len(candidates),
+            afventer,
+        )
 
         if not candidates:
             return
@@ -591,17 +640,25 @@ def _calculate_gaaafstand():
         # -------------------------------------------------------------------
         updated = 0
         skipped = 0
+        # Failures grouped by what went wrong, not logged one student at a
+        # time. When the distance API is down or rate-limiting, every
+        # candidate fails the same way, and thousands of identical warnings
+        # bury the one line that says how many and why.
+        fejl: dict[str, list[str]] = {}
 
         for row in candidates:
             school_lat = row["school_lat"]
             school_lon = row["school_lon"]
 
+            # A safety net rather than the normal path: the query above now
+            # excludes rows without coordinates, so reaching this means the
+            # two have drifted apart.
             if school_lat is None or school_lon is None:
-                logger.warning(
-                    "calculate_gaaafstand: no school coordinates for CPR %s "
-                    "(matrikel_id / ungdomsuddannelse_id may be NULL on Elev) — skipping",
-                    row["cpr"],
-                )
+                fejl.setdefault(
+                    "no school coordinates even though select_sql required "
+                    "them — the query and this check have drifted apart",
+                    [],
+                ).append(row["cpr"])
                 skipped += 1
                 continue
 
@@ -620,20 +677,24 @@ def _calculate_gaaafstand():
                 resp.raise_for_status()
                 distance_km = resp.json()["distance_km"]
             except Exception as exc:
-                logger.warning(
-                    "calculate_gaaafstand: distance API failed for CPR %s — %s",
-                    row["cpr"],
-                    exc,
-                )
+                fejl.setdefault(f"distance API failed: {exc}", []).append(row["cpr"])
                 skipped += 1
                 continue
 
             if config.DRY_RUN:
-                logger.info(
-                    "DRY RUN — CPR %s: would set skoleafstand = %.3f km, kraever_genberegning → 0",
-                    row["cpr"],
-                    distance_km,
-                )
+                # Only the first few: a dry run over the whole student
+                # population would otherwise print one line per student.
+                if updated < 10:
+                    logger.info(
+                        "DRY RUN — CPR %s: would set skoleafstand = %.3f km, "
+                        "kraever_genberegning → 0",
+                        row["cpr"],
+                        distance_km,
+                    )
+                elif updated == 10:
+                    logger.info(
+                        "DRY RUN — ... and the rest; see the count below."
+                    )
             else:
                 cursor.execute(update_sql, distance_km, row["cpr"])
             updated += 1
@@ -641,12 +702,25 @@ def _calculate_gaaafstand():
         if not config.DRY_RUN:
             conn.commit()
 
+    # One line per DISTINCT failure, with a few CPRs to chase it with. The
+    # whole list is useless at this size and the reason is what matters.
+    for grund, cprs in sorted(fejl.items(), key=lambda kv: -len(kv[1])):
+        logger.warning(
+            "calculate_gaaafstand: %d student(s) skipped — %s. CPR(s): %s%s",
+            len(cprs),
+            grund,
+            ", ".join(cprs[:5]),
+            f" (+{len(cprs) - 5} more)" if len(cprs) > 5 else "",
+        )
+
     action = "would write" if config.DRY_RUN else "wrote"
     logger.info(
-        "calculate_gaaafstand: %s %d distances, %d skipped (no school coords or API error)",
+        "calculate_gaaafstand: %s %d distances, %d skipped across %d distinct "
+        "reason(s)",
         action,
         updated,
         skipped,
+        len(fejl),
     )
 
 

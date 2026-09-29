@@ -30,7 +30,7 @@ CI (`.github/workflows/check_version_number.yml`) fails any PR to `main` that do
 
 ## Architecture
 
-The process runs in three phases, each triggered by a CLI flag. `main.py` calls `prod_workqueue.clear_workqueue()` unconditionally at startup, **before** dispatching on any flag — so a `--process` run in a separate invocation from `--queue` wipes the queue it was meant to process. Today all phases must run in a single invocation.
+The process runs in three phases, each triggered by a CLI flag.
 
 1. **`--queue`** (`populate_queue`): Calls `retrieve_items_for_queue()` to build a list of `{reference, data}` dicts, deduplicates against existing ATS workqueue items by reference, then bulk-adds new items via `concurrent_add` (asyncio semaphore + exponential backoff). Items are wrapped as `{"item": {...}}` when added, which is what `get_item_info()` unpacks.
 
@@ -97,11 +97,17 @@ The underlying rule, already stated in `_calculate_gaaafstand`: the data worker 
 
 `mbu-dev-shared-components` reads a separate `PROD` database connection (`RPAConnection`) for SMTP constants (`Error Email`, `Email Friend`, `smtp_server`, `smtp_port`).
 
+### Elev holds every student, not only those with a bevilling
+
+This changed the shape of steps 6 and 7, and step 7 had a ratchet because of it.
+
+`usp_upsert_elev_from_stg` raises `kraever_genberegning` on every **new** student, so with the full population imported almost everyone is flagged. `_calculate_gaaafstand` cleared the flag only after a **successful** measurement, and a student with no bevilling has no `matrikel_id` or `ungdomsuddannelse_id` to measure to — so they were fetched, warned about and skipped every night, for ever, and the candidate set only ever grew.
+
+The candidate query now requires school **and** address coordinates, so those students are never fetched. The flag is deliberately **left raised** on them: "distance never computed" is true, and when a bevilling gives them a school `usp_sync_elev_matrikel_from_bevilling` raises the flag on that change, so they appear of their own accord. Their number is logged as a count each run, since a sudden move in it is worth seeing.
+
+Step 6 was already correct — its `#Delta` uses an `EXCEPT`, so a student whose school is unchanged is never written. But it computed that delta across the whole table. It now considers only students who have a qualifying bevilling or currently carry a school; a student with neither has NULL on both sides and could never reach `#Delta` anyway, so the result is identical.
+
 ### Outstanding TODOs
 
-- The SSL verification bypass block at the top of `main.py` is marked **REMOVE BEFORE DEPLOYMENT** — it disables certificate checks for every `requests` call in the process.
-- `clear_workqueue()` in `main.py` runs before flag dispatch, so it clears the queue even on a `--process`-only run.
-- `_fetch_and_upsert_addresses` still caps its `fetch_sql` at `SELECT top (10)`, so a real run would import ten addresses and step 4 would skip every person whose address was not among them.
-- `retrieve_items_for_queue()` only queues `_fetch_and_upsert_addresses`; the `exec_sp` item is commented out and `_calculate_gaaafstand` has no dispatch branch in `process_item()`, so it cannot be reached even if queued.
+- The SSL verification bypass block in `main.py` is marked **REMOVE BEFORE DEPLOYMENT** — it disables certificate checks for every `requests` call in the process, and its placement after other module code is the sole cause of the three `ruff` failures (`E402` ×2, `I001`).
 - `finalize_process()` is an empty stub.
-- `uv run ruff check .` and `ruff format --check .` currently fail (E402/F401 in `main.py` and `process_item.py`, three files unformatted).
