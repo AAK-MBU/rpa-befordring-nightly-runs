@@ -43,3 +43,20 @@ GAAAFSTAND_VERBOSE = os.getenv("GAAAFSTAND_VERBOSE", "").strip().lower() in (
     "yes",
     "ja",
 )
+
+# ----------------------
+# calculate_gaaafstand — rate limit
+#
+# Every measurement is one OpenRouteService Directions request, made through
+# the backend, and the token's plan allows 60 a minute. Going over does not
+# queue — ORS answers 429, the backend turns that into a 502, and the student
+# is skipped. An unthrottled run therefore measures almost nobody.
+#
+# Set this to the plan's limit, not below it: the step is one request at a
+# time, so 60/minute is also the fastest it can go. Roughly 30 minutes for
+# 1800 students.
+#
+# Override per run with GAAAFSTAND_PER_MINUTE, or set it to 0 to disable the
+# throttle entirely (only sensible against a self-hosted routing service).
+# ----------------------
+GAAAFSTAND_PER_MINUTE = int(os.getenv("GAAAFSTAND_PER_MINUTE", "55"))

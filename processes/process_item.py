@@ -694,6 +694,21 @@ def _calculate_gaaafstand():
         cursor.execute(afventer_sql)
         afventer = cursor.fetchone()[0]
 
+    if config.GAAAFSTAND_PER_MINUTE:
+        logger.info(
+            "calculate_gaaafstand: pacing at %d request(s)/minute to stay "
+            "inside the OpenRouteService plan — about %s for %d student(s).",
+            config.GAAAFSTAND_PER_MINUTE,
+            _varighed(len(candidates) * 60 / config.GAAAFSTAND_PER_MINUTE),
+            len(candidates),
+        )
+    else:
+        logger.warning(
+            "calculate_gaaafstand: throttle disabled "
+            "(GAAAFSTAND_PER_MINUTE=0). Only do this against a routing "
+            "service with no rate limit.\n"
+        )
+
     if config.GAAAFSTAND_LIMIT:
         logger.info(
             "calculate_gaaafstand: TEST RUN — capped at %d student(s), and "
@@ -744,6 +759,12 @@ def _calculate_gaaafstand():
 
     startet = time.monotonic()
     sidste_puls = startet
+
+    # Seconds to leave between requests. The loop is sequential, so pacing is
+    # a sleep before each call rather than a token bucket — there is never
+    # more than one request in flight to burst with.
+    interval = 60 / config.GAAAFSTAND_PER_MINUTE if config.GAAAFSTAND_PER_MINUTE else 0
+    naeste_tidligst = 0.0
 
     def _skriv(batch: list[tuple[float, str]]) -> None:
         """One short transaction per batch — locks held for milliseconds."""
@@ -833,6 +854,18 @@ def _calculate_gaaafstand():
                 school_lon,
             )
 
+        # Pace to the plan's limit. Measured from the START of the previous
+        # request, so a slow response counts towards the interval instead of
+        # being added to it — otherwise a 2-second call plus a 1-second wait
+        # would run at 20/minute, not 60.
+        if interval:
+            vent = naeste_tidligst - time.monotonic()
+
+            if vent > 0:
+                time.sleep(vent)
+
+        naeste_tidligst = time.monotonic() + interval
+
         try:
             resp = requests.get(
                 f"{api_base}/bevilling/calculate_walking_distance",
@@ -845,7 +878,20 @@ def _calculate_gaaafstand():
                 headers=headers,
                 timeout=15,
             )
-            resp.raise_for_status()
+            # The backend turns EVERY OpenRouteService failure into a 502
+            # with the real reason in the body:
+            #
+            #     raise HTTPException(502, detail=f"Distance API error: {e}")
+            #
+            # raise_for_status() reports only "502 Server Error: Bad Gateway",
+            # which is the same sentence whether ORS rate-limited us, rejected
+            # the key or could not route between two points. The body is the
+            # only place the answer exists, so it goes in the message.
+            if not resp.ok:
+                raise RuntimeError(
+                    f"HTTP {resp.status_code} — {resp.text[:300].strip()}"
+                )
+
             svar = resp.json()
             distance_km = svar["distance_km"]
 
