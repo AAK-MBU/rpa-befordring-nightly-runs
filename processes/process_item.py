@@ -2,13 +2,17 @@
 
 import logging
 import os
+import re
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from functools import partial
 
 import pyodbc
 import requests
+from mbu_dev_shared_components.database.connection import RPAConnection
 from mbu_rpa_core.exceptions import BusinessError
+from requests_ntlm import HttpNtlmAuth
 
 from helpers import config
 
@@ -172,26 +176,29 @@ def _nightly_run():
 
     logger.info("nightly_run: starting")
 
-    logger.info("nightly_run: 1/7 — addresses from LOIS")
+    logger.info("nightly_run: 1/8 — addresses from LOIS")
     _fetch_and_upsert_addresses()
 
-    logger.info("nightly_run: 2/7 — Elev_STG -> Elev")
+    logger.info("nightly_run: 2/8 — Elev_STG -> Elev")
     _run_sp("usp_upsert_elev_from_stg", "upsert_elev")
 
-    logger.info("nightly_run: 3/7 — Foraelder_STG -> Foraelder")
+    logger.info("nightly_run: 3/8 — Foraelder_STG -> Foraelder")
     _run_sp("usp_upsert_foraelder_from_stg", "upsert_foraelder")
 
-    logger.info("nightly_run: 4/7 — adresse_id for elever and forældre")
+    logger.info("nightly_run: 4/8 — adresse_id for elever and forældre")
     _fetch_and_upsert_person_adresser()
 
-    logger.info("nightly_run: 5/7 — recalculate bevilling status")
+    logger.info("nightly_run: 5/8 — recalculate bevilling status")
     _exec_sp()
 
-    logger.info("nightly_run: 6/7 — derive school from bevilling")
+    logger.info("nightly_run: 6/8 — derive school from bevilling")
     _run_sp("usp_sync_elev_matrikel_from_bevilling", "sync_elev_matrikel")
 
-    logger.info("nightly_run: 7/7 — walking distance")
+    logger.info("nightly_run: 7/8 — walking distance")
     _calculate_gaaafstand()
+
+    logger.info("nightly_run: 8/8 — GO case links")
+    _embed_esdh_url()
 
     logger.info("nightly_run: complete")
 
@@ -530,6 +537,20 @@ _GAAAFSTAND_BATCH = 100
 # short enough that a stall is distinguishable from ordinary slowness.
 _GAAAFSTAND_HEARTBEAT = 30
 
+# GO case keys look like PPR-2026-123456-001: a base case and a sub-case.
+# The link points at the BASE — that is the student's case page — so the
+# trailing group is stripped. Anchored and strict on purpose: a key that does
+# not have this shape gets no link at all rather than a guessed one, because a
+# wrong link into a case system is worse than no link.
+_PPR_SAG = re.compile(r"^(PPR-\d{4}-\d+)(?:-\d+)?$", re.IGNORECASE)
+
+# GO answers the metadata call with JSON whose "Metadata" field is an XML row,
+# and the relative case path — "cases/PPR01/PPR-2026-123456" — is one of its
+# attributes. PPR01 is a per-case system id that exists nowhere in the
+# befordring database, which is the whole reason for this step.
+_GO_CASE_URL_ATTRIB = "ows_CaseUrl"
+_GO_SIDE = "SitePages/Home.aspx"
+
 # Give up after this many failures in a row. One failure is a bad row; this
 # many is the service being down, and there is nothing to gain from spending
 # hours proving it one student at a time.
@@ -546,6 +567,11 @@ _GAAAFSTAND_429_PAUSE = 65
 # rate-limited. 6 seconds is 10 requests a minute — far below any plan, so
 # hitting this ceiling means the quota is exhausted, not the pace wrong.
 _GAAAFSTAND_MAX_INTERVAL = 6.0
+
+# Case links committed per transaction. Same reasoning as the distance
+# batch: short enough that Bevilling is never locked long enough for the
+# application to notice.
+_ESDH_URL_BATCH = 100
 
 
 def _varighed(sekunder: float) -> str:
@@ -1022,6 +1048,238 @@ def _calculate_gaaafstand():
     )
 
 
+def _go_credentials() -> tuple[str, str, str]:
+    """(endpoint, username, password) for GO, from the RPA credential store.
+
+    The same three values go_journalisering reads. Fetched per run rather than
+    held in the environment, so a rotated password takes effect without
+    redeploying anything.
+    """
+
+    with RPAConnection(db_env="PROD", commit=False) as rpa_conn:
+        return (
+            rpa_conn.get_constant("go_api_endpoint")["value"].rstrip("/"),
+            rpa_conn.get_credential("go_api")["username"],
+            rpa_conn.get_credential("go_api")["decrypted_password"],
+        )
+
+
+def _go_case_url(endpoint: str, auth, sag: str) -> str | None:
+    """The full GO page URL for one case, or None when it cannot be resolved.
+
+    GET /_goapi/Cases/Metadata/<sag> answers with JSON whose "Metadata" field
+    is an XML row. The relative path lives in its ows_CaseUrl attribute:
+
+        ows_CaseUrl="cases/PPR01/PPR-2026-123456"
+
+    PPR01 is a per-case system id, which is why this cannot be composed from
+    the case key alone.
+
+    Returns None on anything unexpected — a missing case, a changed response
+    shape, a network failure. A missing link is a cosmetic gap that the next
+    run retries; a wrong one sends a caseworker into someone else's case.
+    """
+
+    try:
+        response = requests.get(
+            f"{endpoint}/_goapi/Cases/Metadata/{sag}",
+            headers={"Content-Type": "application/json"},
+            auth=auth,
+            timeout=60,
+        )
+    except requests.RequestException as exc:
+        logger.warning("embed_esdh_url: %s — request failed: %s", sag, exc)
+        return None
+
+    if not response.ok:
+        logger.warning(
+            "embed_esdh_url: %s — HTTP %s from GO: %s",
+            sag,
+            response.status_code,
+            response.text[:200].strip(),
+        )
+        return None
+
+    try:
+        metadata = response.json().get("Metadata", "")
+        relativ = ET.fromstring(metadata).attrib.get(_GO_CASE_URL_ATTRIB, "")
+    except (ValueError, ET.ParseError) as exc:
+        logger.warning("embed_esdh_url: %s — could not read metadata: %s", sag, exc)
+        return None
+
+    relativ = relativ.strip().strip("/")
+
+    if not relativ:
+        logger.warning(
+            "embed_esdh_url: %s — GO returned no %s attribute.", sag, _GO_CASE_URL_ATTRIB
+        )
+        return None
+
+    return f"{endpoint}/{relativ}/{_GO_SIDE}"
+
+
+def _embed_esdh_url():
+    """Fill Bevilling.esdh_url for every bevilling that has a key but no link.
+
+    esdh_noegle is shown in the application as plain text, so a caseworker who
+    wants the case in GO has to search for it. The link cannot be built from
+    the key, because GO's URL carries a per-case system id — see _go_case_url.
+
+    One lookup per DISTINCT base case, not per bevilling: a student's
+    bevillinger share a case, and the sub-case suffix does not change the page
+    the link points at.
+
+    Only rows where esdh_url IS NULL are considered, so this is cheap on every
+    night after the first. A case whose link cannot be resolved stays NULL and
+    is retried tomorrow — the same ratchet the walking distance uses, and for
+    the same reason: "not resolved" is true of it, and saying otherwise would
+    hide it for good.
+    """
+
+    select_sql = """
+        SELECT   b.esdh_noegle, COUNT(*) AS antal
+        FROM     [befordring].[Bevilling] b
+        WHERE    b.aktiv = 1
+        AND      b.esdh_url IS NULL
+        AND      NULLIF(LTRIM(RTRIM(b.esdh_noegle)), '') IS NOT NULL
+        GROUP BY b.esdh_noegle
+        ORDER BY b.esdh_noegle
+    """
+
+    update_sql = """
+        UPDATE [befordring].[Bevilling]
+        SET    esdh_url = ?
+        WHERE  aktiv = 1
+        AND    esdh_url IS NULL
+        AND    LTRIM(RTRIM(esdh_noegle)) = ?
+    """
+
+    with _connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(select_sql)
+        rows = _rows_as_dicts(cursor)
+
+    if not rows:
+        logger.info("embed_esdh_url: every bevilling with a case key already has a link.")
+        return
+
+    # noegle -> base case. A key that is not shaped like a PPR case is left
+    # alone rather than guessed at.
+    opgaver: dict[str, str] = {}
+    ukendt_form = 0
+
+    for row in rows:
+        noegle = str(row["esdh_noegle"]).strip()
+        traef = _PPR_SAG.match(noegle)
+
+        if traef:
+            opgaver[noegle] = traef.group(1)
+        else:
+            ukendt_form += 1
+
+    logger.info(
+        "embed_esdh_url: %d case key(s) without a link, across %d bevilling(er). "
+        "%d of them are not shaped like a PPR case and are skipped.",
+        len(opgaver),
+        sum(r["antal"] for r in rows),
+        ukendt_form,
+    )
+
+    if not opgaver:
+        return
+
+    if config.DRY_RUN:
+        for noegle, base in list(opgaver.items())[:10]:
+            logger.info("DRY RUN — %s -> would resolve case %s", noegle, base)
+
+        logger.info("DRY RUN — embed_esdh_url: %d key(s), nothing written.", len(opgaver))
+        return
+
+    endpoint, brugernavn, kodeord = _go_credentials()
+    auth = HttpNtlmAuth(brugernavn, kodeord)
+
+    # No DB connection is held while GO is being called. Same reasoning as
+    # _calculate_gaaafstand: an UPDATE takes an exclusive row lock until the
+    # commit, and a loop of thousands of external calls under one transaction
+    # escalates to a lock on Bevilling — which every page in the application
+    # reads. Resolve first, write in short batches.
+    url_pr_base: dict[str, str | None] = {}
+    ventende: list[tuple[str, str]] = []
+    skrevet = 0
+    uloeste = 0
+    startet = time.monotonic()
+    sidste_puls = startet
+
+    def _skriv(batch: list[tuple[str, str]]) -> int:
+        """One short transaction per batch — locks held for milliseconds."""
+
+        if not batch:
+            return 0
+
+        raekker = 0
+
+        with _connect(autocommit=False) as skrive_conn:
+            cursor = skrive_conn.cursor()
+
+            for url, noegle in batch:
+                cursor.execute(update_sql, url, noegle)
+                raekker += cursor.rowcount
+
+            skrive_conn.commit()
+
+        return raekker
+
+    for i, (noegle, base) in enumerate(opgaver.items(), start=1):
+        if base not in url_pr_base:
+            url_pr_base[base] = _go_case_url(endpoint, auth, base)
+
+        url = url_pr_base[base]
+
+        if url:
+            ventende.append((url, noegle))
+
+            if len(ventende) >= _ESDH_URL_BATCH:
+                skrevet += _skriv(ventende)
+                ventende.clear()
+        else:
+            uloeste += 1
+
+        # One GO call per case and a 60-second timeout each: this step runs for
+        # minutes on the first night. Silence that long reads as a hang.
+        naa = time.monotonic()
+
+        if naa - sidste_puls >= _GAAAFSTAND_HEARTBEAT:
+            sidste_puls = naa
+            forloebet = naa - startet
+            tempo = i / forloebet if forloebet else 0
+
+            logger.info(
+                "embed_esdh_url: %d/%d (%.0f%%) — %d linked, %d unresolved, "
+                "%.1f/s, %s elapsed, ~%s left",
+                i,
+                len(opgaver),
+                100 * i / len(opgaver),
+                skrevet + len(ventende),
+                uloeste,
+                tempo,
+                _varighed(forloebet),
+                _varighed((len(opgaver) - i) / tempo if tempo else 0),
+            )
+
+    skrevet += _skriv(ventende)
+
+    logger.info(
+        "embed_esdh_url: done in %s — resolved %d of %d case(s) in GO and "
+        "linked %d bevilling(er). %d key(s) could not be resolved and are "
+        "retried on the next run.",
+        _varighed(time.monotonic() - startet),
+        sum(1 for u in url_pr_base.values() if u),
+        len(url_pr_base),
+        skrevet,
+        uloeste,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -1053,4 +1311,6 @@ ACTIONS = {
     "usp_sync_elev_matrikel_from_bevilling": partial(_run_sp, "usp_sync_elev_matrikel_from_bevilling", "sync_elev_matrikel"),
 
     "_calculate_gaaafstand": _calculate_gaaafstand,
+
+    "_embed_esdh_url": _embed_esdh_url,
 }
