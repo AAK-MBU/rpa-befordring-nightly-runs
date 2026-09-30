@@ -93,7 +93,7 @@ The underlying rule, already stated in `_calculate_gaaafstand`: the data worker 
 | `ATS_WORKQUEUE_OVERRIDE` | `automation_server_client` | Override the workqueue ID (dev/test use) |
 | `DBCONNECTIONSTRINGBEFORDRING` | every step | Befordringssystemet — the single target. Everything this process writes goes here, and every stored procedure it calls lives here |
 | `DBCONNECTIONSTRINGSERVER29` | `_fetch_and_upsert_addresses`, `_fetch_and_upsert_person_adresser` | LOIS. Source for the address register and the person → address links. Read only |
-| `API_ENDPOINT` / `API_KEY` | `_calculate_gaaafstand` (commented out) | Walking-distance backend |
+| `BEFORDRING_API_ENDPOINT` / `BEFORDRING_API_KEY` | `_calculate_gaaafstand`, `_embed_esdh_url` | The befordring API — walking distance and GO case links |
 
 `mbu-dev-shared-components` reads a separate `PROD` database connection (`RPAConnection`) for SMTP constants (`Error Email`, `Email Friend`, `smtp_server`, `smtp_port`).
 

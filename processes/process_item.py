@@ -602,8 +602,8 @@ def _calculate_gaaafstand():
          kraever_genberegning = 0 in a single UPDATE per student.
     """
 
-    api_base = os.getenv("API_ENDPOINT", "").rstrip("/")
-    api_key  = os.getenv("API_KEY", "")
+    api_base = os.getenv("BEFORDRING_API_ENDPOINT", "").rstrip("/")
+    api_key  = os.getenv("BEFORDRING_API_KEY", "")
     headers  = {"X-API-Key": api_key}
 
     # -----------------------------------------------------------------------
