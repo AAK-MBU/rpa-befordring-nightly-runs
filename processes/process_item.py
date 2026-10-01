@@ -551,6 +551,22 @@ _PPR_SAG = re.compile(r"^(PPR-\d{4}-\d+)(?:-\d+)?$", re.IGNORECASE)
 _GO_CASE_URL_ATTRIB = "ows_CaseUrl"
 _GO_SIDE = "SitePages/Home.aspx"
 
+# GO har TO værter, og de er ikke den samme:
+#
+#   ad.go.aarhuskommune.dk   API'et. Her hentes metadata — go_api_endpoint
+#                            peger herpå, og RPA'ens konto kan nå den.
+#   go.aarhuskommune.dk      Den sagsbehandlerne bruger i browseren.
+#
+# Linket der gemmes på bevillingen skal pege på den SIDSTE. Blev det bygget
+# af api-endpointet, fik sagsbehandleren et link til en vært, hun ikke har
+# adgang til — og linket så rigtigt ud, lige indtil hun klikkede på det.
+#
+# Den relative sti ("cases/PPR01/PPR-2026-123456") er den samme på begge, så
+# det er kun værtsnavnet der skiftes.
+_GO_BRUGER_BASE = os.getenv(
+    "GO_BROWSE_BASE", "https://go.aarhuskommune.dk"
+).rstrip("/")
+
 # Give up after this many failures in a row. One failure is a bad row; this
 # many is the service being down, and there is nothing to gain from spending
 # hours proving it one student at a time.
@@ -1067,6 +1083,9 @@ def _go_credentials() -> tuple[str, str, str]:
 def _go_case_url(endpoint: str, auth, sag: str) -> str | None:
     """The full GO page URL for one case, or None when it cannot be resolved.
 
+    endpoint is the API host, used for the lookup. The URL that comes back is
+    built from _GO_BRUGER_BASE instead — see there for why the two differ.
+
     GET /_goapi/Cases/Metadata/<sag> answers with JSON whose "Metadata" field
     is an XML row. The relative path lives in its ows_CaseUrl attribute:
 
@@ -1115,7 +1134,8 @@ def _go_case_url(endpoint: str, auth, sag: str) -> str | None:
         )
         return None
 
-    return f"{endpoint}/{relativ}/{_GO_SIDE}"
+    # Bygget af brugerværten, ikke af api-endpointet der lige er kaldt.
+    return f"{_GO_BRUGER_BASE}/{relativ}/{_GO_SIDE}"
 
 
 def _embed_esdh_url():

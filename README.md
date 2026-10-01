@@ -71,6 +71,7 @@ Tunables ligger i `helpers/config.py` — bl.a. `MAX_RETRY`, `MAX_CONCURRENCY`, 
 | `DBCONNECTIONSTRINGBEFORDRING` | Befordringssystemet — det eneste mål. Alt, hvad processen skriver, havner her, og alle stored procedures, den kalder, ligger her |
 | `DBCONNECTIONSTRINGSERVER29` | LOIS. Kilde til både adresseregistret og person → adresse-koblingerne. Kun læsning |
 | `BEFORDRING_API_ENDPOINT` / `BEFORDRING_API_KEY` | Befordrings-API'et — bruges af trin 7 (gåafstand) og trin 8 (GO-links) |
+| `GO_BROWSE_BASE` | Værten linkene peger på. Standard `https://go.aarhuskommune.dk` — den sagsbehandlerne bruger, IKKE API'ets `ad.go…` |
 
 SMTP-konstanter (`Error Email`, `Email Friend`, `smtp_server`, `smtp_port`) hentes af `mbu-dev-shared-components` fra `RPAConnection` mod `PROD`.
 

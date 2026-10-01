@@ -94,6 +94,7 @@ The underlying rule, already stated in `_calculate_gaaafstand`: the data worker 
 | `DBCONNECTIONSTRINGBEFORDRING` | every step | Befordringssystemet — the single target. Everything this process writes goes here, and every stored procedure it calls lives here |
 | `DBCONNECTIONSTRINGSERVER29` | `_fetch_and_upsert_addresses`, `_fetch_and_upsert_person_adresser` | LOIS. Source for the address register and the person → address links. Read only |
 | `BEFORDRING_API_ENDPOINT` / `BEFORDRING_API_KEY` | `_calculate_gaaafstand`, `_embed_esdh_url` | The befordring API — walking distance and GO case links |
+| `GO_BROWSE_BASE` | `_embed_esdh_url` | Host the stored links point at. Defaults to `https://go.aarhuskommune.dk` — what caseworkers browse, NOT the `ad.go…` API host |
 
 `mbu-dev-shared-components` reads a separate `PROD` database connection (`RPAConnection`) for SMTP constants (`Error Email`, `Email Friend`, `smtp_server`, `smtp_port`).
 
