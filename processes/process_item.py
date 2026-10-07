@@ -538,39 +538,91 @@ _GAAAFSTAND_BATCH = 100
 _GAAAFSTAND_HEARTBEAT = 30
 
 # GO case keys look like PPR-2026-123456-001: a base case and a sub-case.
-# The link points at the BASE — that is the student's case page — so the
-# trailing group is stripped. Anchored and strict on purpose: a key that does
-# not have this shape gets no link at all rather than a guessed one, because a
-# wrong link into a case system is worse than no link.
-_PPR_SAG = re.compile(r"^(PPR-\d{4}-\d+)(?:-\d+)?$", re.IGNORECASE)
+# Both halves are used, for different things:
+#
+#   group 1  the BASE case, which is what GO's metadata call accepts and what
+#            ows_CaseUrl comes back describing.
+#   group 2  the sub-case number, which selects the foranstaltningsmappe
+#            within that case. Optional in the pattern only as a safety net —
+#            every key in the database carries one.
+#
+# Anchored and strict on purpose: a key that does not have this shape gets no
+# link at all rather than a guessed one, because a wrong link into a case
+# system is worse than no link.
+_PPR_SAG = re.compile(r"^(PPR-\d{4}-\d+)(?:-(\d+))?$", re.IGNORECASE)
 
 # GO answers the metadata call with JSON whose "Metadata" field is an XML row,
 # and the relative case path — "cases/PPR01/PPR-2026-123456" — is one of its
 # attributes. PPR01 is a per-case system id that exists nowhere in the
 # befordring database, which is the whole reason for this step.
 _GO_CASE_URL_ATTRIB = "ows_CaseUrl"
-_GO_SIDE = "SitePages/Home.aspx"
 
-# GO har TO værter, og de er ikke den samme:
+# The base case's own front page. Only used when a key carries no sub-case
+# number, which should not happen — see _subcase_page.
+_GO_HOME_PAGE = "SitePages/Home.aspx"
+
+# The foranstaltningsmappe inside a case. Caseworkers asked for this rather
+# than the PPR case front page: the befordring sag IS the sub-case, so a link
+# to the parent costs another click to find it.
 #
-#   ad.go.aarhuskommune.dk   API'et. Her hentes metadata — go_api_endpoint
-#                            peger herpå, og RPA'ens konto kan nå den.
-#   go.aarhuskommune.dk      Den sagsbehandlerne bruger i browseren.
+# CCMSubID appears twice because GO wants it both as the list filter and as the
+# page's own parameter; sending only one leaves the page on the unfiltered
+# list. Zero-padded exactly as the key spells it ("006", not "6") — the two are
+# different URLs and only the padded one resolves.
 #
-# Linket der gemmes på bevillingen skal pege på den SIDSTE. Blev det bygget
-# af api-endpointet, fik sagsbehandleren et link til en vært, hun ikke har
-# adgang til — og linket så rigtigt ud, lige indtil hun klikkede på det.
+# The same logic lives in rpa-befordring-kontrol (processes/go_lookup.py). The
+# two processes share no code, so a change in one has to be made in both.
+_GO_SUBCASE_PAGE = (
+    "SubNav/SubCase.aspx"
+    "?FilterField1=CCMSubID&FilterValue1={subid}&CCMSubID={subid}"
+)
+
+
+def _subcase_page(subid: str | None) -> str:
+    """The page part of the URL for a sub-case number.
+
+    Falls back to the base case's front page when there is no number. A link
+    to the parent case is worse than one straight to the foranstaltningsmappe,
+    but it is still the right child's case — and that is the line the rest of
+    this module draws too: never guess a link, but a less specific correct one
+    beats none at all.
+
+    Args:
+        subid:
+            The sub-case number from the key, or None.
+
+    Returns:
+        A relative page path, ready to append to the case path.
+    """
+
+    if not subid:
+        return _GO_HOME_PAGE
+
+    # zfill is belt-and-braces: every stored key is already padded, and this
+    # leaves a padded value untouched while rescuing an unpadded one.
+    return _GO_SUBCASE_PAGE.format(subid=subid.zfill(3))
+
+# GO has TWO hosts, and they are not the same:
 #
-# Den relative sti ("cases/PPR01/PPR-2026-123456") er den samme på begge, så
-# det er kun værtsnavnet der skiftes.
-_GO_BRUGER_BASE = os.getenv(
+#   ad.go.aarhuskommune.dk   the API. Metadata is fetched here —
+#                            go_api_endpoint points at it, and this process's
+#                            account can reach it.
+#   go.aarhuskommune.dk      the one caseworkers use in the browser.
+#
+# The link stored on the bevilling must point at the LATTER. Built from the
+# API endpoint, a caseworker would get a link to a host she cannot reach —
+# and it would look right until she clicked it.
+#
+# The relative path ("cases/PPR01/PPR-2026-123456") is the same on both, so
+# only the host name differs.
+_GO_BROWSE_BASE = os.getenv(
     "GO_BROWSE_BASE", "https://go.aarhuskommune.dk"
 ).rstrip("/")
 
 # Give up after this many failures in a row. One failure is a bad row; this
 # many is the service being down, and there is nothing to gain from spending
 # hours proving it one student at a time.
-_GAAAFSTAND_MAX_I_TRAEK = 25
+_GAAAFSTAND_MAX_IN_A_ROW = 25
 
 # A rate-limited request is retried rather than counted as a loss, because the
 # student is fine — we simply asked too fast. Waiting a full window is the
@@ -590,7 +642,7 @@ _GAAAFSTAND_MAX_INTERVAL = 6.0
 _ESDH_URL_BATCH = 100
 
 
-def _varighed(sekunder: float) -> str:
+def _duration(sekunder: float) -> str:
     """Seconds as mm:ss, or h:mm:ss once it runs past an hour."""
 
     sekunder = int(max(sekunder, 0))
@@ -631,7 +683,7 @@ def _calculate_gaaafstand():
     # with the full student population this is a large number and it is not a
     # problem — it is the normal resting state for a student without a
     # bevilling. Logged so a sudden change in it is visible.
-    afventer_sql = """
+    pending_sql = """
         SELECT COUNT(*)
         FROM      [befordring].[Elev]              e
         LEFT JOIN [befordring].[Adresse]            ad
@@ -745,7 +797,7 @@ def _calculate_gaaafstand():
         cursor.execute(select_sql)
         candidates = _rows_as_dicts(cursor)
 
-        cursor.execute(afventer_sql)
+        cursor.execute(pending_sql)
         afventer = cursor.fetchone()[0]
 
     if config.GAAAFSTAND_PER_MINUTE:
@@ -753,7 +805,7 @@ def _calculate_gaaafstand():
             "calculate_gaaafstand: pacing at %d request(s)/minute to stay "
             "inside the OpenRouteService plan — about %s for %d student(s).",
             config.GAAAFSTAND_PER_MINUTE,
-            _varighed(len(candidates) * 60 / config.GAAAFSTAND_PER_MINUTE),
+            _duration(len(candidates) * 60 / config.GAAAFSTAND_PER_MINUTE),
             len(candidates),
         )
     else:
@@ -788,11 +840,11 @@ def _calculate_gaaafstand():
     # When the distance API is down or rate-limiting, every candidate fails
     # the same way, and thousands of identical warnings bury the one line
     # that says how many and why.
-    fejl: dict[str, list[str]] = {}
-    ventende: list[tuple[float, str]] = []
-    i_traek = 0
+    failures: dict[str, list[str]] = {}
+    pending: list[tuple[float, str]] = []
+    in_a_row = 0
 
-    def _noter_fejl(grund: str, cpr: str) -> None:
+    def _note_failure(reason: str, cpr: str) -> None:
         """Record a failure, and say so out loud the first time it happens.
 
         Aggregating keeps a bad night from printing thousands of identical
@@ -801,24 +853,24 @@ def _calculate_gaaafstand():
         The first of each kind is announced; the rest are counted.
         """
 
-        if grund not in fejl:
+        if reason not in failures:
             logger.warning(
                 "calculate_gaaafstand: %s (first seen on CPR %s; further "
                 "occurrences are counted, not logged)",
-                grund,
+                reason,
                 cpr,
             )
 
-        fejl.setdefault(grund, []).append(cpr)
+        failures.setdefault(reason, []).append(cpr)
 
-    startet = time.monotonic()
-    sidste_puls = startet
+    started = time.monotonic()
+    last_heartbeat = started
 
     # Seconds to leave between requests. The loop is sequential, so pacing is
     # a sleep before each call rather than a token bucket — there is never
     # more than one request in flight to burst with.
     interval = 60 / config.GAAAFSTAND_PER_MINUTE if config.GAAAFSTAND_PER_MINUTE else 0
-    naeste_tidligst = 0.0
+    next_earliest = 0.0
 
     def _skriv(batch: list[tuple[float, str]]) -> None:
         """One short transaction per batch — locks held for milliseconds."""
@@ -855,13 +907,13 @@ def _calculate_gaaafstand():
         #
         # On the clock rather than every N students, so the interval stays
         # the same however fast or slow the distance API happens to be.
-        naa = time.monotonic()
+        now = time.monotonic()
 
-        if naa - sidste_puls >= _GAAAFSTAND_HEARTBEAT:
-            sidste_puls = naa
-            forloebet = naa - startet
-            tempo = (i - 1) / forloebet if forloebet else 0
-            tilbage = (len(candidates) - i + 1) / tempo if tempo else 0
+        if now - last_heartbeat >= _GAAAFSTAND_HEARTBEAT:
+            last_heartbeat = now
+            elapsed = now - started
+            rate = (i - 1) / elapsed if elapsed else 0
+            tilbage = (len(candidates) - i + 1) / rate if rate else 0
 
             logger.info(
                 "calculate_gaaafstand: %d/%d (%.0f%%) — %d measured, %d "
@@ -871,9 +923,9 @@ def _calculate_gaaafstand():
                 100 * (i - 1) / len(candidates),
                 updated,
                 skipped,
-                tempo,
-                _varighed(forloebet),
-                _varighed(tilbage),
+                rate,
+                _duration(elapsed),
+                _duration(tilbage),
             )
 
         school_lat = row["school_lat"]
@@ -883,7 +935,7 @@ def _calculate_gaaafstand():
         # excludes rows without coordinates, so reaching this means the
         # two have drifted apart.
         if school_lat is None or school_lon is None:
-            _noter_fejl(
+            _note_failure(
                 "no school coordinates even though select_sql required "
                 "them — the query and this check have drifted apart",
                 row["cpr"],
@@ -920,16 +972,16 @@ def _calculate_gaaafstand():
         # window never drains and every remaining request is rejected. Forty
         # students went through, then nothing, for the rest of the run.
         distance_km = None
-        grund = None
+        reason = None
 
         for forsoeg in range(1, _GAAAFSTAND_429_FORSOEG + 1):
             if interval:
-                vent = naeste_tidligst - time.monotonic()
+                wait = next_earliest - time.monotonic()
 
-                if vent > 0:
-                    time.sleep(vent)
+                if wait > 0:
+                    time.sleep(wait)
 
-            naeste_tidligst = time.monotonic() + interval
+            next_earliest = time.monotonic() + interval
 
             try:
                 resp = requests.get(
@@ -973,7 +1025,7 @@ def _calculate_gaaafstand():
                 besked = str(exc)
                 rate_limited = False
 
-            grund = f"distance API failed: {besked}"
+            reason = f"distance API failed: {besked}"
 
             if not rate_limited or forsoeg == _GAAAFSTAND_429_FORSOEG:
                 break
@@ -993,35 +1045,35 @@ def _calculate_gaaafstand():
             )
 
             time.sleep(_GAAAFSTAND_429_PAUSE)
-            naeste_tidligst = time.monotonic()
+            next_earliest = time.monotonic()
 
         if distance_km is None:
-            _noter_fejl(grund or "distance API failed: unknown", row["cpr"])
+            _note_failure(reason or "distance API failed: unknown", row["cpr"])
             skipped += 1
-            i_traek += 1
+            in_a_row += 1
 
             # Nothing is getting through. At a 15-second timeout each, 1800
             # students is most of a day of failing one at a time — so stop
             # and say why instead of grinding through the whole list. The
             # flags stay raised, so the next run simply picks them all up.
-            if i_traek >= _GAAAFSTAND_MAX_I_TRAEK:
+            if in_a_row >= _GAAAFSTAND_MAX_IN_A_ROW:
                 logger.error(
                     "calculate_gaaafstand: %d consecutive failures — giving "
                     "up after %d of %d student(s). Every unmeasured student "
                     "keeps kraever_genberegning = 1, so nothing is lost and "
                     "the next run picks them up. Last reason: %s",
-                    i_traek,
+                    in_a_row,
                     i,
                     len(candidates),
-                    grund,
+                    reason,
                 )
                 break
 
             continue
 
-        i_traek = 0
+        in_a_row = 0
 
-        ventende.append((distance_km, row["cpr"]))
+        pending.append((distance_km, row["cpr"]))
         updated += 1
 
         if config.GAAAFSTAND_VERBOSE:
@@ -1032,20 +1084,20 @@ def _calculate_gaaafstand():
                 "(DRY RUN — skrives ikke)" if config.DRY_RUN else "(i naeste batch)",
             )
 
-        if len(ventende) >= (1 if config.GAAAFSTAND_LIMIT else _GAAAFSTAND_BATCH):
-            _skriv(ventende)
-            ventende.clear()
+        if len(pending) >= (1 if config.GAAAFSTAND_LIMIT else _GAAAFSTAND_BATCH):
+            _skriv(pending)
+            pending.clear()
 
 
-    _skriv(ventende)
+    _skriv(pending)
 
     # One line per DISTINCT failure, with a few CPRs to chase it with. The
     # whole list is useless at this size and the reason is what matters.
-    for grund, cprs in sorted(fejl.items(), key=lambda kv: -len(kv[1])):
+    for reason, cprs in sorted(failures.items(), key=lambda kv: -len(kv[1])):
         logger.warning(
             "calculate_gaaafstand: %d student(s) skipped — %s. CPR(s): %s%s",
             len(cprs),
-            grund,
+            reason,
             ", ".join(cprs[:5]),
             f" (+{len(cprs) - 5} more)" if len(cprs) > 5 else "",
         )
@@ -1055,11 +1107,11 @@ def _calculate_gaaafstand():
         "calculate_gaaafstand: done in %s — %s %d distances, %d skipped "
         "across %d distinct reason(s). %d student(s) still flagged for a "
         "later run.",
-        _varighed(time.monotonic() - startet),
+        _duration(time.monotonic() - started),
         action,
         updated,
         skipped,
-        len(fejl),
+        len(failures),
         afventer + skipped,
     )
 
@@ -1080,11 +1132,14 @@ def _go_credentials() -> tuple[str, str, str]:
         )
 
 
-def _go_case_url(endpoint: str, auth, sag: str) -> str | None:
-    """The full GO page URL for one case, or None when it cannot be resolved.
+def _go_case_path(endpoint: str, auth, sag: str) -> str | None:
+    """The relative GO path for one BASE case, or None if it cannot be resolved.
 
-    endpoint is the API host, used for the lookup. The URL that comes back is
-    built from _GO_BRUGER_BASE instead — see there for why the two differ.
+    Returns the path ("cases/PPR01/PPR-2026-123456") rather than a finished
+    URL, because the host and the page are added by the caller. That split is
+    what lets one lookup serve every bevilling under the same case: they share
+    the base but each points at its own foranstaltningsmappe, so the sub-case
+    number — and therefore the final URL — differs per key.
 
     GET /_goapi/Cases/Metadata/<sag> answers with JSON whose "Metadata" field
     is an XML row. The relative path lives in its ows_CaseUrl attribute:
@@ -1134,8 +1189,7 @@ def _go_case_url(endpoint: str, auth, sag: str) -> str | None:
         )
         return None
 
-    # Bygget af brugerværten, ikke af api-endpointet der lige er kaldt.
-    return f"{_GO_BRUGER_BASE}/{relativ}/{_GO_SIDE}"
+    return relativ
 
 
 def _embed_esdh_url():
@@ -1143,7 +1197,7 @@ def _embed_esdh_url():
 
     esdh_noegle is shown in the application as plain text, so a caseworker who
     wants the case in GO has to search for it. The link cannot be built from
-    the key, because GO's URL carries a per-case system id — see _go_case_url.
+    the key, because GO's URL carries a per-case system id — see _go_case_path.
 
     One lookup per DISTINCT base case, not per bevilling: a student's
     bevillinger share a case, and the sub-case suffix does not change the page
@@ -1183,36 +1237,39 @@ def _embed_esdh_url():
         logger.info("embed_esdh_url: every bevilling with a case key already has a link.")
         return
 
-    # noegle -> base case. A key that is not shaped like a PPR case is left
-    # alone rather than guessed at.
-    opgaver: dict[str, str] = {}
-    ukendt_form = 0
+    # noegle -> (base case, sub-case number). A key that is not shaped like a
+    # PPR case is left alone rather than guessed at.
+    tasks: dict[str, tuple[str, str | None]] = {}
+    unknown_shape = 0
 
     for row in rows:
         noegle = str(row["esdh_noegle"]).strip()
-        traef = _PPR_SAG.match(noegle)
+        hit = _PPR_SAG.match(noegle)
 
-        if traef:
-            opgaver[noegle] = traef.group(1)
+        if hit:
+            tasks[noegle] = (hit.group(1), hit.group(2))
         else:
-            ukendt_form += 1
+            unknown_shape += 1
 
     logger.info(
         "embed_esdh_url: %d case key(s) without a link, across %d bevilling(er). "
         "%d of them are not shaped like a PPR case and are skipped.",
-        len(opgaver),
+        len(tasks),
         sum(r["antal"] for r in rows),
-        ukendt_form,
+        unknown_shape,
     )
 
-    if not opgaver:
+    if not tasks:
         return
 
     if config.DRY_RUN:
-        for noegle, base in list(opgaver.items())[:10]:
-            logger.info("DRY RUN — %s -> would resolve case %s", noegle, base)
+        for noegle, (base, subid) in list(tasks.items())[:10]:
+            logger.info(
+                "DRY RUN — %s -> would resolve case %s, sub-case %s",
+                noegle, base, subid or "(none)",
+            )
 
-        logger.info("DRY RUN — embed_esdh_url: %d key(s), nothing written.", len(opgaver))
+        logger.info("DRY RUN — embed_esdh_url: %d key(s), nothing written.", len(tasks))
         return
 
     endpoint, brugernavn, kodeord = _go_credentials()
@@ -1223,12 +1280,15 @@ def _embed_esdh_url():
     # commit, and a loop of thousands of external calls under one transaction
     # escalates to a lock on Bevilling — which every page in the application
     # reads. Resolve first, write in short batches.
-    url_pr_base: dict[str, str | None] = {}
-    ventende: list[tuple[str, str]] = []
-    skrevet = 0
-    uloeste = 0
-    startet = time.monotonic()
-    sidste_puls = startet
+    # Keyed on the base case because that is what costs a GO call. The URL is
+    # composed per key below, since two bevillinger on the same case point at
+    # different foranstaltningsmapper.
+    path_by_case: dict[str, str | None] = {}
+    pending: list[tuple[str, str]] = []
+    written = 0
+    unresolved = 0
+    started = time.monotonic()
+    last_heartbeat = started
 
     def _skriv(batch: list[tuple[str, str]]) -> int:
         """One short transaction per batch — locks held for milliseconds."""
@@ -1249,54 +1309,56 @@ def _embed_esdh_url():
 
         return raekker
 
-    for i, (noegle, base) in enumerate(opgaver.items(), start=1):
-        if base not in url_pr_base:
-            url_pr_base[base] = _go_case_url(endpoint, auth, base)
+    for i, (noegle, (base, subid)) in enumerate(tasks.items(), start=1):
+        if base not in path_by_case:
+            path_by_case[base] = _go_case_path(endpoint, auth, base)
 
-        url = url_pr_base[base]
+        case_path = path_by_case[base]
 
-        if url:
-            ventende.append((url, noegle))
+        if case_path:
+            # Built from the BROWSER host, not the API endpoint just called.
+            url = f"{_GO_BROWSE_BASE}/{case_path}/{_subcase_page(subid)}"
+            pending.append((url, noegle))
 
-            if len(ventende) >= _ESDH_URL_BATCH:
-                skrevet += _skriv(ventende)
-                ventende.clear()
+            if len(pending) >= _ESDH_URL_BATCH:
+                written += _skriv(pending)
+                pending.clear()
         else:
-            uloeste += 1
+            unresolved += 1
 
         # One GO call per case and a 60-second timeout each: this step runs for
         # minutes on the first night. Silence that long reads as a hang.
-        naa = time.monotonic()
+        now = time.monotonic()
 
-        if naa - sidste_puls >= _GAAAFSTAND_HEARTBEAT:
-            sidste_puls = naa
-            forloebet = naa - startet
-            tempo = i / forloebet if forloebet else 0
+        if now - last_heartbeat >= _GAAAFSTAND_HEARTBEAT:
+            last_heartbeat = now
+            elapsed = now - started
+            rate = i / elapsed if elapsed else 0
 
             logger.info(
                 "embed_esdh_url: %d/%d (%.0f%%) — %d linked, %d unresolved, "
                 "%.1f/s, %s elapsed, ~%s left",
                 i,
-                len(opgaver),
-                100 * i / len(opgaver),
-                skrevet + len(ventende),
-                uloeste,
-                tempo,
-                _varighed(forloebet),
-                _varighed((len(opgaver) - i) / tempo if tempo else 0),
+                len(tasks),
+                100 * i / len(tasks),
+                written + len(pending),
+                unresolved,
+                rate,
+                _duration(elapsed),
+                _duration((len(tasks) - i) / rate if rate else 0),
             )
 
-    skrevet += _skriv(ventende)
+    written += _skriv(pending)
 
     logger.info(
         "embed_esdh_url: done in %s — resolved %d of %d case(s) in GO and "
         "linked %d bevilling(er). %d key(s) could not be resolved and are "
         "retried on the next run.",
-        _varighed(time.monotonic() - startet),
-        sum(1 for u in url_pr_base.values() if u),
-        len(url_pr_base),
-        skrevet,
-        uloeste,
+        _duration(time.monotonic() - started),
+        sum(1 for path in path_by_case.values() if path),
+        len(path_by_case),
+        written,
+        unresolved,
     )
 
 
