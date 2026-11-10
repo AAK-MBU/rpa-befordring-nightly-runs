@@ -61,7 +61,21 @@ def process_item(item_data: dict, item_reference: str):
     handler()
 
 
-def _connect(autocommit: bool = True):
+# Longest any statement may wait for ANOTHER session's lock before failing.
+_LOCK_TIMEOUT_MS = 10_000
+
+# Default query timeout. Generous on purpose: the upsert procedures
+# legitimately run for minutes over the full student population, and the point
+# is that nothing is UNBOUNDED, not that everything is quick.
+_DEFAULT_QUERY_TIMEOUT_S = 1800
+
+# Writes get a tight one. They hold exclusive locks that the application queues
+# behind, so the cost of one hanging is paid by every caseworker, not by this
+# process — see the note in _calculate_gaaafstand's _skriv.
+_WRITE_QUERY_TIMEOUT_S = 60
+
+
+def _connect(autocommit: bool = True, timeout: int = _DEFAULT_QUERY_TIMEOUT_S):
     """Open a connection to Befordringssystemet.
 
     autocommit defaults to True because most statements here are EXEC calls,
@@ -71,11 +85,41 @@ def _connect(autocommit: bool = True):
     transaction that no longer exists.
 
     Pass autocommit=False where several statements must land together.
+
+    BOTH TIMEOUTS EXIST BECAUSE OF A REAL OUTAGE, twice: on 9 and 10 Nov 2026
+    the run reached the walking-distance step at 02:13 and its write of THREE
+    rows took 4 hours 45 minutes ("committed 3 measurement(s) in 17113.37s").
+    For all of that time it held exclusive locks on Elev, which
+    view_All_Bevillinger joins — so every page in the application queued behind
+    it, the API's connection pool drained to nothing, and the site served 504s
+    and 500s until someone killed the session by hand.
+
+    Nothing here was wrong except that it was unbounded: no query timeout and
+    no lock timeout, so a stall of any kind became a wait without end. With
+    these, the same night fails inside a minute, the item retries or goes
+    pending_user, and the framework's error mail arrives — instead of silence
+    while the application is unusable.
+
+    SET LOCK_TIMEOUT is issued while the connection is still in autocommit, and
+    autocommit is switched afterwards: under manual-commit the SET would itself
+    open the transaction this is meant to keep short.
     """
 
     _require(DBCONNECTIONSTRINGBEFORDRING=CONN_STRING_BEFORDRING)
 
-    return pyodbc.connect(CONN_STRING_BEFORDRING, autocommit=autocommit)
+    conn = pyodbc.connect(CONN_STRING_BEFORDRING, autocommit=True)
+    conn.timeout = timeout
+
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(f"SET LOCK_TIMEOUT {_LOCK_TIMEOUT_MS}")
+    finally:
+        cursor.close()
+
+    conn.autocommit = autocommit
+
+    return conn
 
 
 def _rows_as_dicts(cursor) -> list[dict]:
@@ -884,7 +928,14 @@ def _calculate_gaaafstand():
 
         t0 = time.monotonic()
 
-        with _connect(autocommit=False) as skrive_conn:
+        # Logged before the write, not only after. The heartbeat above reports
+        # progress through the MEASURING loop and then goes quiet here, so on
+        # the two nights this hung the log simply stopped — a stalled write and
+        # a finished run looked identical until the next line appeared hours
+        # later. The one state worth seeing was the one that said nothing.
+        logger.info("calculate_gaaafstand: writing %d measurement(s)", len(batch))
+
+        with _connect(autocommit=False, timeout=_WRITE_QUERY_TIMEOUT_S) as skrive_conn:
             skrive_conn.cursor().executemany(update_sql, batch)
             skrive_conn.commit()
 
@@ -1298,7 +1349,9 @@ def _embed_esdh_url():
 
         raekker = 0
 
-        with _connect(autocommit=False) as skrive_conn:
+        logger.info("embed_esdh_url: writing %d link(s)", len(batch))
+
+        with _connect(autocommit=False, timeout=_WRITE_QUERY_TIMEOUT_S) as skrive_conn:
             cursor = skrive_conn.cursor()
 
             for url, noegle in batch:

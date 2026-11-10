@@ -1,6 +1,6 @@
 [project]
 name = "rpa-befordring-nightly-runs"
-version = "0.0.2"
+version = "0.0.3"
 description = "Robot der kører natligt og fanger datobaserede ændringer der påvirker befordring"
 readme = "README.md"
 requires-python = ">=3.13"
