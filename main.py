@@ -21,14 +21,14 @@ from processes.queue_handler import concurrent_add, retrieve_items_for_queue
 logger = logging.getLogger(__name__)
 
 
-import requests
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-_old_request = requests.Session.request
-def unsafe_request(self, *args, **kwargs):
-    kwargs['verify'] = False
-    return _old_request(self, *args, **kwargs)
-requests.Session.request = unsafe_request
+# import requests
+# import urllib3
+# urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# _old_request = requests.Session.request
+# def unsafe_request(self, *args, **kwargs):
+#     kwargs['verify'] = False
+#     return _old_request(self, *args, **kwargs)
+# requests.Session.request = unsafe_request
 
 
 async def populate_queue(workqueue: Workqueue, action: str):

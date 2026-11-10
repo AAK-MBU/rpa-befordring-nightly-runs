@@ -70,6 +70,10 @@ Step 5 runs **before** step 6 deliberately: it is what turns Kommende into Aktiv
 
 One database access style: raw `pyodbc`, through `_connect()` in `process_item.py`. It defaults to `autocommit=True`, because every stored procedure in this pipeline opens and commits its own transaction — wrapping those in an outer one only nests them, and a procedure that hits its `CATCH` rolls back every level at once, leaving the caller holding a transaction that no longer exists. `_calculate_gaaafstand` is the exception and passes `autocommit=False`, since its per-student updates should land together.
 
+Every connection is bounded. `_connect()` sets `SET LOCK_TIMEOUT 10000` and a query timeout — 1800s by default, 60s on the two write paths (`_skriv` in `_calculate_gaaafstand` and in `_embed_esdh_url`). The default is generous because the upsert procedures legitimately run for minutes over the full student population; the point is that nothing is *unbounded*.
+
+Why: on 9 and 10 Nov 2026 the walking-distance write of **three rows** took 4h45m (`committed 3 measurement(s) in 17113.37s`), holding exclusive locks on `Elev` throughout. `view_All_Bevillinger` joins `Elev`, so every page in the application queued behind it, the API's connection pool drained, and the site was down until someone killed the session by hand. Nothing was wrong except that there was no limit, so a stall became a wait without end.
+
 This replaced a SQLAlchemy session factory in `helpers/db.py`. Nothing here maps a model or uses a relationship — every statement is a literal `EXEC` or `SELECT` — so the ORM was machinery with no job, and its session reading one connection variable while the pyodbc steps read another is how the two ended up pointing at different databases.
 
 ### Elev is not written from here

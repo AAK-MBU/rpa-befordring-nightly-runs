@@ -59,6 +59,8 @@ Reglen bag: data-workeren ejer `Elev` og skriver de gældende værdier dertil. I
 
 ## Konfiguration
 
+Alle databaseforbindelser er tidsbegrænsede: `_connect()` sætter `SET LOCK_TIMEOUT 10000` og en query-timeout — 1800 sekunder som standard, 60 på de to skrivestier (`_skriv`). Baggrunden er to nedbrud 9. og 10. november 2026, hvor gåafstandstrinnets skrivning af **tre rækker** tog 4 timer og 45 minutter og hele tiden holdt eksklusive låse på `Elev`. `view_All_Bevillinger` joiner `Elev`, så hele applikationen stod i kø bag den, API'ets connection pool løb tør, og siden var nede, indtil sessionen blev dræbt manuelt. Intet var forkert ud over, at der ingen grænse var.
+
 Tunables ligger i `helpers/config.py` — bl.a. `MAX_RETRY`, `MAX_CONCURRENCY`, `RETRY_BASE_DELAY` og `DRY_RUN`. Med `DRY_RUN = True` kalder `_exec_sp` sin stored procedure med `@dry_run = 1` og committer ikke; adresseimporten skriver dog stadig.
 
 ### Miljøvariabler (`.env`)

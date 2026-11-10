@@ -548,7 +548,7 @@ wheels = [
 
 [[package]]
 name = "rpa-befordring-nightly-runs"
-version = "0.0.2"
+version = "0.0.3"
 source = { virtual = "." }
 dependencies = [
     { name = "automation-server-client" },
